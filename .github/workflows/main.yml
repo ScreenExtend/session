@@ -1,6 +1,12 @@
+name: Deploy website
+
 on:
-  - push
-  - pull_request
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions: write-all
 
 jobs:
   build:
@@ -16,9 +22,11 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: Install dependencies
-        uses: pnpm install
+        run: pnpm install
 
       - name: Build project
         run: pnpm run build
