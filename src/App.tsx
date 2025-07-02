@@ -65,9 +65,9 @@ export default function ConnectionPage() {
   };
 
   useEffect(() => {
-    const id = new URL(window.location.href).pathname.match(/[^/]+/g);
-    if (id && id.length > 0 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test([...id][id.length-1])) {
-      setSession([...id][id.length-1]);
+    const id = new URL(window.location.href).searchParams.get("id");
+    if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      setSession(id);
     } else {
       setIdDisabled(false);
     }
