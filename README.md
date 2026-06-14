@@ -54,7 +54,7 @@ Requires a recent stable Rust toolchain.
 
 ```sh
 cargo run            # development
-cargo build --release && ./target/release/session-backend-rust
+cargo build --release && ./target/release/session
 ```
 
 The server listens on `0.0.0.0:$PORT` (default `8080`). It speaks plain HTTP and expects to
