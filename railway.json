@@ -1,8 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "builder": "RAILPACK",
-    "buildCommand": "cargo build --release --locked"
+    "builder": "RAILPACK"
   },
   "deploy": {
     "startCommand": "./target/release/session-backend-rust",
