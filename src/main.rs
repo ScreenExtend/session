@@ -31,6 +31,10 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 const LOGO_SVG: &str = include_str!("../static/logo.svg");
 const TRANSFORM_WORKER_JS: &str = include_str!("../static/transform-worker.js");
+const INPUT_JS: &str = include_str!("../static/input.js");
+const AUDIO_JS: &str = include_str!("../static/audio.js");
+const AUDIO_WORKLET_JS: &str = include_str!("../static/audio-worklet.js");
+const NOSLEEP_JS: &str = include_str!("../static/nosleep.js");
 
 const SESSION_ID_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const HEARTBEAT_SEC: u64 = 20;
@@ -236,6 +240,10 @@ async fn main() {
         .route("/styles.css", get(styles))
         .route("/logo.svg", get(logo))
         .route("/transform-worker.js", get(worker))
+        .route("/input.js", get(input_js))
+        .route("/audio.js", get(audio_js))
+        .route("/audio-worklet.js", get(audio_worklet_js))
+        .route("/nosleep.js", get(nosleep_js))
         .route("/health", get(health))
         .route("/ice-config", get(ice_config))
         .route("/net-config", get(net_config))
@@ -266,11 +274,21 @@ async fn main() {
 }
 
 async fn index(headers: HeaderMap) -> Response {
+    let html = INDEX_HTML.replace("__SAME_DEVICE_FLAG__", "false");
     let mut resp = (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        INDEX_HTML,
+        html,
     )
         .into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        header::HeaderName::from_static("cross-origin-embedder-policy"),
+        header::HeaderValue::from_static("require-corp"),
+    );
     if read_cid(&headers).is_none() {
         let cid = mint_cid();
         if let Ok(v) = cookie_header(&cid).parse() {
@@ -294,6 +312,22 @@ async fn worker() -> Response {
         TRANSFORM_WORKER_JS,
     )
         .into_response()
+}
+
+async fn input_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript")], INPUT_JS).into_response()
+}
+
+async fn audio_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript")], AUDIO_JS).into_response()
+}
+
+async fn audio_worklet_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript")], AUDIO_WORKLET_JS).into_response()
+}
+
+async fn nosleep_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript")], NOSLEEP_JS).into_response()
 }
 
 async fn health() -> &'static str {
@@ -435,6 +469,17 @@ fn build_tunnel_response(resp: SignalResponse, set_cookie: Option<String>) -> Re
     *out.status_mut() = status;
     if let Ok(v) = content_type.parse() {
         out.headers_mut().insert(header::CONTENT_TYPE, v);
+    }
+    if let Some(token) = resp
+        .headers
+        .get("x-device-token")
+        .or_else(|| resp.headers.get("X-Device-Token"))
+        .and_then(|v| v.as_str())
+    {
+        if let Ok(v) = token.parse() {
+            out.headers_mut()
+                .insert(header::HeaderName::from_static("x-device-token"), v);
+        }
     }
     no_store(out.headers_mut());
     apply_set_cookie(&mut out, set_cookie);

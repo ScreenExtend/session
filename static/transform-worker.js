@@ -6,6 +6,7 @@ let configured = false;
 let waitingForKey = true;
 let sizedCanvas = false;
 let renderedOnce = false;
+let renderFromTs = 0;
 
 let framesIn = 0;
 let keyframesIn = 0;
@@ -14,6 +15,12 @@ let framesRendered = 0;
 let lastKeyRequestAt = 0;
 let configError = null;
 
+const RTP_HZ = 90000;
+let rtpUnwrapLast = null;
+let rtpWraps = 0;
+let videoDelayEmaMs = null;
+let lastAvsyncPostMs = 0;
+
 const CODEC_CANDIDATES = [
   'avc1.640034', 'avc1.640028', 'avc1.64001F',
   'avc1.4D4034', 'avc1.4D401F',
@@ -21,16 +28,69 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 8;
+
+let estimatedFps = 60;
+let lastRtpTicks = null;
+let lastRtpWallMs = null;
+let backlogCount = 0;
+
+let preferredCodec = null;
 
 self.onmessage = (e) => {
   if (e.data && e.data.type === 'canvas') {
     canvas = e.data.canvas;
     ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  } else if (e.data && e.data.type === 'codechint') {
+    if (e.data.profileLevelId && /^[0-9a-fA-F]{6}$/.test(e.data.profileLevelId)) {
+      preferredCodec = 'avc1.' + e.data.profileLevelId.toUpperCase();
+    }
   } else if (e.data && e.data.type === 'stats') {
     postStats();
+  } else if (e.data && e.data.type === 'rendercount') {
+    self.postMessage({ type: 'rendercount', n: framesRendered });
+  } else if (e.data && e.data.type === 'encodedstream') {
+    self.postMessage({ type: 'transformstart', hasReadable: !!e.data.readable, hasSendKey: false });
+    startPump(e.data.readable);
   }
 };
+
+function reportAvSync(tsTicks) {
+  const ts = tsTicks >>> 0;
+  if (rtpUnwrapLast !== null) {
+    const d = ts - rtpUnwrapLast;
+    if (d < -0x80000000) rtpWraps++;
+    else if (d > 0x80000000) rtpWraps--;
+  }
+  rtpUnwrapLast = ts;
+  const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
+  const drawAbsMs = performance.timeOrigin + performance.now();
+  const delta = drawAbsMs - videoHostMs;
+  if (videoDelayEmaMs === null) {
+    videoDelayEmaMs = delta;
+  } else {
+    const a = delta < videoDelayEmaMs ? 0.30 : 0.05;
+    videoDelayEmaMs = videoDelayEmaMs * (1 - a) + delta * a;
+  }
+
+  const nowMs = performance.now();
+  if (lastRtpTicks !== null && lastRtpWallMs !== null) {
+    const tickDelta = ((ts - lastRtpTicks) >>> 0);
+    const wallDelta = nowMs - lastRtpWallMs;
+    if (tickDelta > 0 && wallDelta > 0 && wallDelta < 200) {
+      const frameFps = RTP_HZ / tickDelta;
+      if (frameFps >= 10 && frameFps <= 240) {
+        estimatedFps = estimatedFps * 0.95 + frameFps * 0.05;
+      }
+    }
+  }
+  lastRtpTicks = ts;
+  lastRtpWallMs = nowMs;
+
+  if (nowMs - lastAvsyncPostMs > 200) {
+    lastAvsyncPostMs = nowMs;
+    self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs });
+  }
+}
 
 function postStats() {
   self.postMessage({
@@ -52,9 +112,10 @@ function makeDecoder() {
           canvas.height = frame.displayHeight;
           sizedCanvas = true;
         }
-        if (ctx) {
+        if (ctx && frame.timestamp >= renderFromTs) {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           framesRendered++;
+          reportAvSync(frame.timestamp);
           if (!renderedOnce) {
             renderedOnce = true;
             self.postMessage({ type: 'rendered' });
@@ -73,13 +134,22 @@ function makeDecoder() {
 
 async function ensureConfigured() {
   if (configured && decoder && decoder.state !== 'closed') return true;
-  let codec = CODEC_CANDIDATES[0];
+  const candidates = preferredCodec
+    ? [preferredCodec, ...CODEC_CANDIDATES.filter((c) => c !== preferredCodec)]
+    : CODEC_CANDIDATES.slice();
+  let codec = candidates[0];
   if (typeof VideoDecoder.isConfigSupported === 'function') {
-    for (const c of CODEC_CANDIDATES) {
+    let anySupported = false;
+    for (const c of candidates) {
       try {
-        const s = await VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true });
-        if (s && s.supported) { codec = c; break; }
+        const s = await VideoDecoder.isConfigSupported({ codec: c });
+        if (s && s.supported) { codec = c; anySupported = true; break; }
       } catch (_) {}
+    }
+    if (!anySupported) {
+      configError = 'no supported H.264 decoder configuration';
+      self.postMessage({ type: 'configerror', message: configError, codec });
+      throw new Error(configError);
     }
   }
   decoder = makeDecoder();
@@ -123,7 +193,11 @@ self.onrtctransform = (event) => {
     hasReadable: !!(transformer && transformer.readable),
     hasSendKey: !!(transformer && typeof transformer.sendKeyFrameRequest === 'function'),
   });
-  const reader = transformer.readable.getReader();
+  startPump(transformer.readable);
+};
+
+function startPump(readable) {
+  const reader = readable.getReader();
 
   ensureConfigured().then(() => requestKey(true)).catch(() => {});
 
@@ -152,17 +226,28 @@ self.onrtctransform = (event) => {
         continue;
       }
 
-      if (renderedOnce && !waitingForKey && decoder &&
-          decoder.decodeQueueSize > BACKLOG_DROP_THRESHOLD && type !== 'key') {
-        self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
-        waitingForKey = true;
-        requestKey(true);
-        continue;
+      if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
+        const backlogThreshold = Math.max(3, Math.round(estimatedFps * 0.05));
+        if (decoder.decodeQueueSize > backlogThreshold) {
+          backlogCount++;
+          if (backlogCount >= 2) {
+            self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
+            waitingForKey = true;
+            backlogCount = 0;
+            requestKey(false);
+          }
+          continue;
+        } else {
+          backlogCount = 0;
+        }
       }
 
       try {
-        await ensureConfigured();
-        if (waitingForKey && type === 'key') waitingForKey = false;
+        if (!configured || !decoder || decoder.state === 'closed') await ensureConfigured();
+        if (waitingForKey && type === 'key') {
+          waitingForKey = false;
+          renderFromTs = encodedFrame.timestamp;
+        }
         decoder.decode(
           new EncodedVideoChunk({
             type,
@@ -176,4 +261,4 @@ self.onrtctransform = (event) => {
       }
     }
   })();
-};
+}

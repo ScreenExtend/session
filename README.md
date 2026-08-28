@@ -39,7 +39,7 @@ via the `clientId → sessionId` binding recorded on the client's last successfu
 | Method & path | Handled by | Notes |
 | --- | --- | --- |
 | `GET /` | relay | Serves `index.html`, sets the `se_cid` cookie. |
-| `GET /styles.css`, `/logo.svg`, `/transform-worker.js` | relay | Static join-page assets, served verbatim. |
+| `GET /styles.css`, `/logo.svg`, `/transform-worker.js`, `/input.js`, `/audio.js`, `/audio-worklet.js`, `/nosleep.js` | relay | Static join-page assets, served verbatim. |
 | `GET /health` | relay | Returns `ok` (relay liveness). |
 | `GET /ice-config` | relay | STUN + time-limited TURN credentials. |
 | `GET /net-config` | relay | `{"httpsPort":443}`. |
@@ -117,4 +117,8 @@ static/                  # join-page assets, embedded at build time via include_
   styles.css             # page styles
   logo.svg               # logo
   transform-worker.js    # client-side WebCodecs decode/render worker
+  input.js               # remote keyboard/mouse/touch over a WebRTC DataChannel
+  audio.js               # system-audio decode (WebCodecs Opus) + playback
+  audio-worklet.js       # audio jitter buffer / A-V sync worklet
+  nosleep.js             # keeps the client screen awake while streaming
 ```

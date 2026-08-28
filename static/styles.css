@@ -11,14 +11,23 @@ html, body {
     font: 14px / 1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
 
-#video, #canvas {
+#stage {
     position: fixed;
     inset: 0;
-    width: 100vw;
-    height: 100vh;
+    background: #000;
+}
+
+#video, #canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     background: #000;
     display: none;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 #unmute {
@@ -37,7 +46,7 @@ html, body {
     transform: translateX(-50%);
 }
 
-#modal {
+#modal, #compatModal, #sameDeviceModal {
     position: fixed;
     inset: 0;
     z-index: 20;
@@ -48,11 +57,11 @@ html, body {
     background: rgba(0, 0, 0, 0.66);
 }
 
-#modal.show {
+#modal.show, #compatModal.show, #sameDeviceModal.show {
     display: flex;
 }
 
-#modal .card {
+#modal .card, #compatModal .card, #sameDeviceModal .card {
     max-width: 430px;
     background: #14171d;
     border: 1px solid #2a2f3a;
@@ -61,24 +70,24 @@ html, body {
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 
-#modal h2 {
+#modal h2, #compatModal h2, #sameDeviceModal h2 {
     margin: 0 0 .55rem;
     font-size: 16px;
     color: #e6e9ef;
 }
 
-#modal p {
+#modal p, #compatModal p, #sameDeviceModal p {
     margin: 0 0 1rem;
     color: #aab2c2;
 }
 
-#modal .row {
+#modal .row, #compatModal .row, #sameDeviceModal .row {
     display: flex;
     gap: .6rem;
     flex-wrap: wrap;
 }
 
-#modal button {
+#modal button, #compatModal button, #sameDeviceModal button {
     padding: .55rem 1rem;
     border: 0;
     border-radius: 9px;
@@ -86,14 +95,47 @@ html, body {
     cursor: pointer;
 }
 
-#goHttps {
+#goHttps, #compatContinue {
     background: #2a6df0;
     color: #fff;
 }
 
-#dismiss {
+#dismiss, #sameDeviceDismiss {
     background: #2a2f3a;
     color: #cdd3df;
+}
+
+#compatModal ul {
+    margin: 0 0 1rem;
+    padding-left: 1.15rem;
+    color: #aab2c2;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+}
+
+#compatModal ul b {
+    color: #cdd3df;
+}
+
+#compatModal .check {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    margin: 0 0 1rem;
+}
+
+#compatModal .check input {
+    width: 15px;
+    height: 15px;
+    accent-color: #2a6df0;
+    cursor: pointer;
+}
+
+#compatModal .check label {
+    font-size: 13px;
+    color: #aab2c2;
+    cursor: pointer;
 }
 
 #join {
@@ -259,6 +301,43 @@ html, body {
 
 .otp input.filled {
     border-color: #3a4150;
+}
+
+.fs-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: .55rem;
+    margin-bottom: 1.25rem;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.fs-toggle input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 1px 0 0;
+    accent-color: #2a6df0;
+    cursor: pointer;
+}
+
+.fs-toggle-text {
+    display: flex;
+    flex-direction: column;
+    gap: .15rem;
+}
+
+.fs-toggle-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #e6e9ef;
+}
+
+.fs-toggle-desc {
+    font-size: 12px;
+    line-height: 1.35;
+    color: #8b93a3;
 }
 
 .btn {
