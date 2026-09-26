@@ -8,6 +8,36 @@
         <link rel="icon" type="image/svg+xml" href="/logo.svg" />
         <title>ScreenExtend Session</title>
         <link rel="stylesheet" href="/styles.css" />
+        <style>
+            #permModal {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                z-index: 20;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 1rem;
+                background: rgba(0, 0, 0, 0.66);
+            }
+            #permModal .card {
+                max-width: 430px;
+                background: #14171d;
+                border: 1px solid #2a2f3a;
+                border-radius: 14px;
+                padding: 1.25rem 1.4rem;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            }
+            #permModal h2 { margin: 0 0 .55rem; font-size: 16px; color: #e6e9ef; }
+            #permModal p { margin: 0 0 1rem; color: #aab2c2; }
+            #permModal .row { display: flex; flex-wrap: wrap; margin: -.3rem; }
+            #permModal .row > * { margin: .3rem; }
+            #permModal button { padding: .55rem 1rem; border: 0; border-radius: 9px; font-size: 14px; cursor: pointer; }
+            #permContinue { background: #2a6df0; color: #fff; }
+            #permSkip { background: #2a2f3a; color: #cdd3df; }
+        </style>
         <script>window.__SAME_DEVICE__ = __SAME_DEVICE_FLAG__;</script>
     </head>
     <body>
@@ -67,6 +97,7 @@
         <div id="stage">
             <canvas id="canvas"></canvas>
             <video id="video" autoplay playsinline muted tabindex="-1" disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback"></video>
+            <div id="linkStatus" role="status" aria-live="polite"><span class="spin"></span><span id="linkStatusText"></span></div>
             <button id="unmute">Tap to start playback</button>
             <input id="imeSink" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" style="position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0;" />
         </div>
@@ -74,7 +105,7 @@
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
             <div class="card">
                 <h2>Switch to HTTPS: faster and more secure</h2>
-                <p>This page is on an insecure (HTTP) connection, so your join code is sent unencrypted and the browser blocks the fastest path to stream video. The secure version keeps your code private and is faster. Your browser may warn about the self-signed certificate once, which is expected on a local network; choose to More Info/Advanced --> Proceed to site.</p>
+                <p>This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video and audio paths on a secure one, so switching makes the screen faster as well as private. You will see a one-time warning about the self-signed certificate; that is expected — choose Advanced (or More Info), then continue to the site.</p>
                 <div class="row">
                     <button id="goHttps">Switch to HTTPS</button>
                     <button id="dismiss">Stay on HTTP</button>
@@ -108,9 +139,20 @@
             </div>
         </div>
 
+        <div id="permModal" role="dialog" aria-modal="true" style="z-index: 9996">
+            <div class="card">
+                <h2>Allow microphone access</h2>
+                <p>To let the host choose where this device plays audio (a specific speaker, or the phone's earpiece), ScreenExtend needs brief microphone access to detect the available outputs. Your microphone is never recorded or streamed.</p>
+                <div class="row">
+                    <button id="permContinue" type="button">Continue</button>
+                    <button id="permSkip" type="button">Not now</button>
+                </div>
+            </div>
+        </div>
+
         <script src="/input.js"></script>
         <script src="/audio.js"></script>
-        <!-- NoSleep.min.js v0.12.0 (Rich Tibbett, MIT) — served from /nosleep.js -->
+        <!-- NoSleep.min.js v0.12.0 (Rich Tibbett, MIT) -->
         <script src="/nosleep.js"></script>
         <script>
             const video = document.getElementById('video');
@@ -121,18 +163,92 @@
             const compatModal = document.getElementById('compatModal');
             const errEl = document.getElementById('errorMessage');
             const loadingEl = document.getElementById('loading');
+            const linkStatusEl = document.getElementById('linkStatus');
+            const linkStatusText = document.getElementById('linkStatusText');
 
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
-            const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
-            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false, sab: false };
-            const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+            // RTCRtpScriptTransform is preferred wherever it exists, and Chrome 141+ has both
+            // it and the legacy createEncodedStreams. Only the standard one carries
+            // sendKeyFrameRequest(), and the transform runs *instead of* libwebrtc's
+            // reference finder, so a receiver without it can never ask for an IDR: a single
+            // lost keyframe froze the picture until a watchdog demoted the whole session to
+            // <video>. `forceLegacyTransform` is the escape hatch if the standard path turns
+            // out not to start on some build.
+            let forceLegacyTransform = false;
+            function useScriptTransformNow() {
+                return hasScriptTransform && !forceLegacyTransform;
+            }
+            let audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
+            let audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
+            // Presentation tier override for the manual A/B in docs/manual-tests/client-page.md.
+            // `canvas` is the default and the floor; `track` routes decoded frames through a
+            // VideoTrackGenerator into the <video> element, which may or may not win a
+            // hardware overlay depending on the platform.
+            const PRESENT_PREF = (/(?:[?&#])present=(\w+)/.exec(location.search + location.hash) || [])[1] || 'canvas';
+
+            // Everything the page used to swallow in a bare `catch (_) { noteSuppressed(); }` — 63 of them —
+            // now lands here and rides the once-a-second stats frame to the host. A silent
+            // degradation is one nobody ever fixes.
+            const DEG = {
+                FULLSCREEN_DENIED: 1 << 0,
+                POINTER_LOCK_DENIED: 1 << 1,
+                UNADJUSTED_MOVEMENT_UNAVAILABLE: 1 << 2,
+                WAKE_LOCK_API_ABSENT: 1 << 3,
+                WAKE_LOCK_REFUSED: 1 << 4,
+                AUDIO_PREPARE_FAILED: 1 << 5,
+                AUDIO_OPUS_UNSUPPORTED: 1 << 6,
+                AUDIO_CONTEXT_SUSPENDED: 1 << 7,
+                AUDIO_OUTPUT_LATENCY_ESTIMATED: 1 << 8,
+                AUDIO_OUTPUT_LABELS_UNAVAILABLE: 1 << 9,
+                SCRIPT_TRANSFORM_UNAVAILABLE: 1 << 10,
+                KEYFRAME_REQUEST_IMPOSSIBLE: 1 << 11,
+                OFFSCREEN_CANVAS_UNAVAILABLE: 1 << 12,
+                DEMOTED_TO_VIDEO: 1 << 13,
+                COALESCED_EVENTS_UNAVAILABLE: 1 << 14,
+                ICE_GATHERING_DEADLINE: 1 << 15,
+                NO_H264_FMTP: 1 << 16,
+                DECODER_HW_UNAVAILABLE: 1 << 17,
+                REFRESH_RATE_MEASURED: 1 << 18,
+                TRANSFORM_FELL_BACK_TO_LEGACY: 1 << 19,
+                RVFC_UNAVAILABLE: 1 << 20,
+                KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
+                TRICKLE_ICE_UNAVAILABLE: 1 << 22,
+                // Set the first time a dialog on this page took the locks and the input
+                // forwarding away from the host so the user could reach it. Without it the
+                // host sees a device that stopped sending input and cannot tell a modal from
+                // a wedge.
+                INPUT_SUSPENDED_FOR_MODAL: 1 << 23,
+                // The answer carried no join id and no cookie set one, so every later request
+                // this tab makes names no session: `/reconfig` reads zeros forever, `/leave`
+                // reaches nothing, and the host holds the display until the grace runs out.
+                // Only a proxy that strips both can produce it, which is exactly the kind of
+                // failure that is invisible without a bit.
+                JOIN_ID_MISSING: 1 << 24,
+            };
+            let degradeFlags = 0;
+            let suppressedErrors = 0;
+            function degrade(bit) { degradeFlags |= bit; }
+            function undegrade(bit) { degradeFlags &= ~bit; }
+            function noteSuppressed() { suppressedErrors++; }
+
+            if (!hasScriptTransform) degrade(DEG.SCRIPT_TRANSFORM_UNAVAILABLE);
+            if (typeof canvas.transferControlToOffscreen !== 'function') degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+            if (!(navigator.keyboard && navigator.keyboard.lock)) degrade(DEG.KEYBOARD_LOCK_UNAVAILABLE);
+            if (typeof video.requestVideoFrameCallback !== 'function') degrade(DEG.RVFC_UNAVAILABLE);
+            if (!(window.PointerEvent && ('getCoalescedEvents' in PointerEvent.prototype))) {
+                degrade(DEG.COALESCED_EVENTS_UNAVAILABLE);
+            }
 
             let pc = null;
             let worker = null;
+            // The host clock offset is measured on the input channel and has to reach both
+            // workers; neither can measure it itself, and a worker's `performance` origin is
+            // its own creation, so only the absolute form crosses the boundary meaningfully.
+            let hostClockOffsetMs = null;
             let watchdog = null;
             let statsPoll = null;
             let liveWatch = null;
@@ -141,6 +257,56 @@
             let renderStalls = 0;
             let usingFallback = false;
             let joinData = null;
+            // The host names each session at `POST /whep` and hands the name back in
+            // `X-Join-Id`. It belongs to this tab and to no other, so it lives in
+            // `sessionStorage`: `localStorage` is shared by every tab of an origin, which is
+            // precisely why two tabs used to be one session on the host. The device token
+            // stays in `localStorage` on purpose — that one *is* shared, because both tabs are
+            // the same device and share its settings.
+            var JOIN_ID_KEY = 'se.joinId';
+            var currentJoinId = '';
+
+            function setJoinId(id) {
+                currentJoinId = id || '';
+                try {
+                    if (currentJoinId) sessionStorage.setItem(JOIN_ID_KEY, currentJoinId);
+                    else sessionStorage.removeItem(JOIN_ID_KEY);
+                } catch (_) { noteSuppressed(); }
+            }
+
+            function readStoredJoinId() {
+                try { return sessionStorage.getItem(JOIN_ID_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
+            }
+
+            // Every session-scoped request carries the id. A request without one names nothing
+            // and the host answers with nothing, which is the correct answer: it will not guess
+            // from the address, because addresses move under a live session and are handed on
+            // to the next device that asks for one.
+            function withJoin(path) {
+                if (!currentJoinId) return path;
+                return path + (path.indexOf('?') < 0 ? '?' : '&') + 'join=' + encodeURIComponent(currentJoinId);
+            }
+
+            // Release the session this tab holds, so the host takes its display down now rather
+            // than after the disconnect grace. `sendBeacon` because this also runs from
+            // `pagehide`, where a `fetch` is not guaranteed to leave.
+            function releaseJoin(id) {
+                var join = id || currentJoinId;
+                if (!join) return;
+                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(join)); } catch (_) { noteSuppressed(); }
+                if (join === currentJoinId) setJoinId('');
+            }
+
+            // A tab that reloaded still has the previous session's id, and the host is holding
+            // that display against a rejoin that is never coming under that name. Letting it go
+            // here costs one beacon and saves the whole disconnect grace.
+            (function releaseStaleJoin() {
+                var stale = readStoredJoinId();
+                if (!stale) return;
+                setJoinId('');
+                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(stale)); } catch (_) { noteSuppressed(); }
+            })();
+
             let reconfigPoll = null;
             let reconfigEpoch = null;
             let kickEpoch = null;
@@ -149,11 +315,101 @@
             let compatBlocked = false;
             let fullscreenMode = true;
 
+            const PROBE_OK_MS = 1000;
+            const PROBE_FAST_MS = 300;
+            const DEGRADE_AFTER_MS = 1200;
+            const DROP_AFTER_MS = 5000;
+            const REFUSED_MS = 400;
+            const REFUSED_STREAK = 3;
+
+            const BYE_HOST_EXIT = 0x02;
+
+            let lastAliveAt = 0;
+            let degraded = false;
+            let refusedStreak = 0;
+
+            function nowMs() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+
+            function showLinkStatus(msg) {
+                linkStatusText.textContent = msg || '';
+                linkStatusEl.classList.toggle('show', !!msg);
+                stage.classList.toggle('stalled', !!msg);
+            }
+
+            function markAlive() {
+                lastAliveAt = nowMs();
+                refusedStreak = 0;
+                if (degraded) {
+                    degraded = false;
+                    showLinkStatus('');
+                }
+            }
+
+            function enterDegraded() {
+                if (!isLive || kicked || reconfiguring) return;
+                degraded = true;
+                showLinkStatus(navigator.onLine === false ? 'Offline — waiting for your network' : 'Reconnecting…');
+            }
+
+            function evaluateLink() {
+                if (!isLive || kicked || reconfiguring) return;
+                const silent = nowMs() - lastAliveAt;
+                if (silent >= DEGRADE_AFTER_MS) enterDegraded();
+                if (navigator.onLine === false) return;
+                if (!degraded) return;
+                if (refusedStreak >= REFUSED_STREAK) {
+                    linkLost('The host is no longer reachable.');
+                } else if (silent >= DROP_AFTER_MS) {
+                    linkLost('Disconnected, reconnect to continue.');
+                }
+            }
+
+            // The link went away and the page is offering to reconnect. That is not a departure,
+            // so the join is kept: the host holds the display behind its disconnect grace, the
+            // dashboard row stays where it is, and pressing Connect continues the same session on
+            // the same display with the windows still on it. Beaconing `/leave` here is what made
+            // a settings change that took too long read as "device left, device joined" — a row
+            // that vanished and came back, two notifications, a second display and every window
+            // shuffled onto the primary monitor. Only a page that is actually going away
+            // (`pagehide`) or a session the host has ended (`kickDevice`) releases the join.
+            function linkLost(msg) {
+                if (kicked) return;
+                teardownSession(true);
+                usingFallback = false;
+                showLinkStatus('');
+                showError(msg);
+            }
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') markAlive();
+            });
+
+            window.SEHealth = {
+                alive: markAlive,
+                bye(code) {
+                    kickDevice(code === BYE_HOST_EXIT
+                        ? 'The host stopped sharing this screen.'
+                        : 'You have been removed from this session.');
+                },
+            };
+
+            // A DOMException with an empty message — an AbortError from a cancelled
+            // setRemoteDescription, some InvalidStateErrors — used to reach showError as ''
+            // and leave the spinner up over a disabled Connect button with no text, forever.
+            function errorText(err) {
+                if (!err) return 'Connection failed.';
+                return (err.message && String(err.message)) || String(err) || 'Connection failed.';
+            }
             function showError(msg) {
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
-                    if (locked) stopLock();
+                    // The session is over, so the frozen frame the rebuild was holding on to is
+                    // no longer standing in for anything, and a picker armed for a sink that
+                    // session was going to use would open on the next click of the join form.
+                    dropStaleCanvas();
+                    cancelQueuedPicker();
+                    stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
                     joinEl.style.display = '';
@@ -163,23 +419,124 @@
                 }
             }
             function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
-            function showVideo() { video.style.display = 'block'; canvas.style.display = 'none'; }
+            function showVideo() {
+                video.style.display = 'block';
+                canvas.style.display = 'none';
+                // The picture now comes from the element, so a held-over canvas would sit on
+                // top of it showing the frame the session had before it demoted.
+                dropStaleCanvas();
+            }
 
+            // The letterboxed picture rect that input coordinates are normalised against
+            // needs the intrinsic size, and on the <video> paths this is where it arrives.
+            function relayVideoSize() {
+                if (!(video.videoWidth > 0)) return;
+                try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+            }
+            video.addEventListener('loadedmetadata', relayVideoSize);
+            video.addEventListener('resize', relayVideoSize);
+
+            // A rebuild cannot reuse a canvas whose control has been transferred to a worker, so
+            // every WebCodecs (re)start has to replace the element — and replacing it outright
+            // blanked the stage for the whole rebuild. That is the black stage behind every
+            // host-initiated reconfigure (a scale or refresh change from the dashboard), every
+            // orientation flip and every demotion. So the old canvas is kept on screen, the
+            // replacement is inserted behind it, and the first frame the new session paints is
+            // what removes the old one.
+            let staleCanvas = null;
+            function dropStaleCanvas() {
+                const old = staleCanvas;
+                if (!old) return;
+                staleCanvas = null;
+                try { if (old.parentNode) old.parentNode.removeChild(old); } catch (_) { noteSuppressed(); }
+            }
             function freshCanvas() {
                 const replacement = document.createElement('canvas');
                 replacement.id = 'canvas';
-                canvas.replaceWith(replacement);
+                if (isLive && canvas.style.display === 'block' && canvas.parentNode) {
+                    dropStaleCanvas();
+                    canvas.removeAttribute('id');
+                    canvas.className = 'stale';
+                    canvas.parentNode.insertBefore(replacement, canvas);
+                    staleCanvas = canvas;
+                } else {
+                    canvas.replaceWith(replacement);
+                }
                 canvas = replacement;
                 if (locked && !currentFullscreenEl()) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
                 return canvas;
             }
 
             let isLive = false;
+
+            // Trickle ICE is kept for the speed, but its *outcome* is resolved before the
+            // streaming stage appears. The three ways it can fail — the answer named no
+            // resource, the verb was refused, nothing was ever acknowledged — all end in a
+            // rejoin with a gathered offer, and a rejoin behind a picture the user is already
+            // using is the one thing that must never happen. So the first rendered frame arms
+            // the transition and the sender's own "nothing more to send" performs it, which is
+            // `a=end-of-candidates` acknowledged on the happy path.
+            //
+            // The deadline is a net for a browser that emits neither a null candidate nor
+            // `iceGatheringState === 'complete'`, not a budget: it is well past any real
+            // gathering, including a TURN allocation, and it reports itself as bit 15.
+            //
+            // It is armed when the answer names the trickle resource, not when the offer is
+            // posted. Nothing the sender does can happen before that — it has no URL to PATCH —
+            // and neither can a frame, because the peer connection does not exist until the
+            // answer is set. So the window before the answer is one where the hold is holding
+            // nothing back and gathering is not what is being waited on. Armed at the offer, the
+            // deadline covered the WHEP round trip as well, and that round trip creates a virtual
+            // display: `DISPLAY_ATTACH_TIMEOUT` alone is 5 s and `DISPLAY_CORRELATION_LOCK`
+            // serialises it across joins, so a host that was merely slow reported a *gathering*
+            // failure for a join that then succeeded — and held the picture for 8 s to do it.
+            // `WHEP_TIMEOUT_MS` (10 s) is what bounds a host that never answers.
+            const ICE_SETTLE_DEADLINE_MS = 8000;
+            let icePending = false;
+            let liveHeld = false;
+            let iceSettleTimer = 0;
+            // Latched for the life of one peer connection: once ICE has come up, a trickle
+            // failure must not rejoin, however the connection is doing afterwards. Without the
+            // latch a session that connected and later degraded could answer a refused PATCH
+            // with a rejoin behind the picture the user is watching, which is the one thing the
+            // hold exists to prevent.
+            let iceEverConnected = false;
+            function holdStageForIce() {
+                icePending = true;
+                liveHeld = false;
+                if (iceSettleTimer) { clearTimeout(iceSettleTimer); iceSettleTimer = 0; }
+            }
+            function armIceSettleDeadline() {
+                if (!icePending || iceSettleTimer) return;
+                iceSettleTimer = setTimeout(function () {
+                    iceSettleTimer = 0;
+                    if (!icePending) return;
+                    degrade(DEG.ICE_GATHERING_DEADLINE);
+                    iceSettled();
+                }, ICE_SETTLE_DEADLINE_MS);
+            }
+            function releaseIceHold() {
+                icePending = false;
+                liveHeld = false;
+                if (iceSettleTimer) { clearTimeout(iceSettleTimer); iceSettleTimer = 0; }
+            }
+            function iceSettled() {
+                if (!icePending) return;
+                const held = liveHeld;
+                releaseIceHold();
+                if (held) onStreamLive();
+            }
+
             function onStreamLive() {
+                // Frames are arriving, so nothing below is still waiting for one: both
+                // watchdogs stand down here even when the stage transition is held.
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                clearReconfigWatchdog();
+                if (icePending) { liveHeld = true; return; }
                 reconfiguring = false;
                 loadingEl.classList.remove('show');
+                dropStaleCanvas();
                 if (isLive) { startReconfigPoll(); return; }
                 isLive = true;
                 showError('');
@@ -187,54 +544,152 @@
                 setTimeout(() => { joinEl.style.display = 'none'; }, 450);
                 startLock();
                 startReconfigPoll();
-                refineRefreshRate();
+                // Keep refining in the background; it is applied by the next reconfigure
+                // rather than by forcing one.
+                // A *second* measurement, not the promise the join already consumed — that
+                // one has resolved and re-reading it can only ever hand back the number
+                // already in joinData, which made the refinement structurally inert.
+                // Sixty samples this time, and only now that the page is foregrounded and
+                // painting, so it is a better measurement than the one the join could
+                // wait for rather than the same one again.
+                getRefreshRate(REFRESH_REFINE_SAMPLES).then(
+                    (r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
             }
 
             async function startReconfigPoll() {
+                markAlive();
                 if (reconfigPoll) return;
                 if (reconfigEpoch === null) {
                     try {
-                        const r = await fetch('/reconfig');
-                        if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; }
-                    } catch (_) {}
+                        const r = await fetch(withJoin('/reconfig'));
+                        if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; markAlive(); }
+                    } catch (_) { noteSuppressed(); }
                 }
-                reconfigPoll = setInterval(async () => {
-                    if (reconfiguring || kicked) return;
-                    try {
-                        const r = await fetch('/reconfig');
-                        if (!r.ok) return;
-                        const j = await r.json();
-                        if (kickEpoch !== null && j.kick !== kickEpoch) {
-                            kickEpoch = j.kick;
-                            kickDevice();
-                            return;
-                        }
-                        kickEpoch = j.kick;
-                        if (reconfigEpoch !== null && j.epoch !== reconfigEpoch) {
-                            reconfigEpoch = j.epoch;
-                            reconfigure();
-                        } else {
-                            reconfigEpoch = j.epoch;
-                        }
-                    } catch (_) {}
-                }, 1000);
+                armProbe();
             }
 
-            function kickDevice() {
+            function armProbe() {
+                if (reconfigPoll || kicked || reconfiguring || !isLive) return;
+                const suspect = degraded || refusedStreak > 0;
+                reconfigPoll = setTimeout(probeTick, suspect ? PROBE_FAST_MS : PROBE_OK_MS);
+            }
+
+            async function probeTick() {
+                reconfigPoll = null;
+                if (kicked || reconfiguring || !isLive) return;
+                const startedAt = nowMs();
+                let payload = null;
+                let unreachable = false;
+                try {
+                    const r = await fetch(withJoin('/reconfig'));
+                    if (r.ok) payload = await r.json();
+                    else if (r.status >= 502 && r.status <= 504) unreachable = true;
+                } catch (_) {
+                    unreachable = nowMs() - startedAt < REFUSED_MS;
+                }
+                if (kicked || reconfiguring || !isLive) return;
+                if (payload) {
+                    markAlive();
+                    applyReconfig(payload);
+                } else {
+                    refusedStreak = unreachable ? refusedStreak + 1 : 0;
+                    evaluateLink();
+                }
+                armProbe();
+            }
+
+            // The host's answer is a small set of fields and each one belongs to a class: the
+            // sink is audio-only, the kick epoch ends the session, and the reconfig epoch is the
+            // only thing that costs a renegotiation. Act on what moved — the poll runs about
+            // once a second and re-applying an unchanged value is work the class does not call
+            // for, which for the sink meant commanding the audio graph a speaker it was already
+            // playing on sixty times a minute.
+            function applyReconfig(j) {
+                if (typeof j.audioSink === 'string' && j.audioSink !== appliedSinkId) {
+                    appliedSinkId = j.audioSink;
+                    // Applied silently, on whatever ids this device has. Where the labels were
+                    // never revealed — the microphone card was declined before the join — the
+                    // host's picker shows opaque ids and the routing still works; that is what
+                    // `degraded` bit 9 is for. Nothing here may raise a prompt: once the picture
+                    // is up, the session is not interrupted again.
+                    //
+                    // `false` is the engine refusing, not "not yet": a sink commanded before the
+                    // graph exists answers `null` and is applied when it does. Where the engine
+                    // refused there is one thing left to try, and it needs a gesture, so it is
+                    // queued for the next one rather than raised over the picture.
+                    //
+                    // `audioSink` is in *every* `/reconfig` body, so this runs about once a
+                    // second and `false` is answered about once a second too — the engine that
+                    // refused the id refuses it again on the next tick. The offer is therefore
+                    // latched on the id: one re-offer per sink the host asks for, which is what
+                    // the ruling says. Without the latch the picker re-armed on every tick and
+                    // the stage swallowed every gesture for the rest of the session.
+                    try {
+                        if (window.SEAudio) {
+                            Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
+                                if (ok !== false) return;
+                                // The engine refused, so the value is not applied and must be
+                                // retried on the next poll rather than latched as done.
+                                appliedSinkId = null;
+                                if (j.audioSink === lastOfferedSinkId) return;
+                                lastOfferedSinkId = j.audioSink;
+                                queueOutputPicker(j.audioSink);
+                            }, noteSuppressed);
+                        } else {
+                            // There is no audio graph to command yet, so nothing was applied and
+                            // the latch must not claim otherwise — the host may never send this
+                            // value again.
+                            appliedSinkId = null;
+                        }
+                    } catch (_) { appliedSinkId = null; noteSuppressed(); }
+                }
+                if (kickEpoch !== null && j.kick !== kickEpoch) {
+                    kickEpoch = j.kick;
+                    kickDevice();
+                    return;
+                }
+                kickEpoch = j.kick;
+                if (reconfigEpoch !== null && j.epoch !== reconfigEpoch) {
+                    reconfigEpoch = j.epoch;
+                    reconfigure();
+                } else {
+                    reconfigEpoch = j.epoch;
+                }
+            }
+
+            function kickDevice(msg) {
                 if (kicked) return;
                 kicked = true;
                 teardownSession();
                 isLive = false;
                 stopLock();
-                showError('You have been removed from this session.');
+                showLinkStatus('');
+                showError(msg || 'You have been removed from this session.');
             }
 
+            // While `reconfiguring` is set, every recovery path on the page returns early —
+            // the probe tick, the link evaluation, the connection-state handler and the leave
+            // beacon. A rebuild that never completes therefore leaves the last decoded frame
+            // frozen with no spinner, no status and no reconnect, so it gets its own deadline.
+            const RECONFIG_DEADLINE_MS = 15000;
+            let reconfigWatchdog = null;
+            function clearReconfigWatchdog() {
+                if (reconfigWatchdog) { clearTimeout(reconfigWatchdog); reconfigWatchdog = null; }
+            }
             function reconfigure() {
                 if (reconfiguring) return;
                 reconfiguring = true;
-                teardownSession();
                 usingFallback = false;
-                start(true);
+                clearReconfigWatchdog();
+                reconfigWatchdog = setTimeout(() => {
+                    reconfigWatchdog = null;
+                    if (!reconfiguring) return;
+                    reconfiguring = false;
+                    linkLost('Disconnected, reconnect to continue.');
+                }, RECONFIG_DEADLINE_MS);
+                // The same session offering again: the host changes the display's mode under it
+                // and the last decoded frame stays on screen until the new one paints.
+                start(true, true);
             }
 
             let lastGeomKey = null;
@@ -243,8 +698,8 @@
             const viewportSettledSubs = [];
             function onViewportSettled(cb) { viewportSettledSubs.push(cb); }
             function emitViewportSettled() {
-                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) {} }
-                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) {}
+                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) { noteSuppressed(); } }
+                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) { noteSuppressed(); }
             }
 
             function readOrientationPortrait() {
@@ -343,9 +798,34 @@
 
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
 
-            const LOCK_KEYS = ['Escape', 'MetaLeft', 'MetaRight', 'AltLeft', 'AltRight', 'F11'];
             const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'keydown', 'wheel'];
-            const noSleep = new NoSleep();
+
+            // Screen Wake Lock (Chrome 84, Firefox 126, Safari 16.4 partial / 18.4 full) is
+            // the real API; nosleep.js — which keeps the screen alive by looping a tiny
+            // video — is the floor beneath it. NoSleep is constructed lazily so a failed
+            // /nosleep.js fetch cannot take the rest of this script down with it, which a
+            // top-level `new NoSleep()` did.
+            let noSleepImpl = null;
+            let noSleepTried = false;
+            function getNoSleep() {
+                if (noSleepTried) return noSleepImpl;
+                noSleepTried = true;
+                try {
+                    if (typeof NoSleep === 'function') {
+                        noSleepImpl = new NoSleep();
+                        // The bundled build plays an *unmuted* looping clip; muting it also
+                        // relaxes the autoplay rules that would otherwise refuse it.
+                        if (noSleepImpl.noSleepVideo) noSleepImpl.noSleepVideo.muted = true;
+                    }
+                } catch (_) { noteSuppressed(); noSleepImpl = null; }
+                return noSleepImpl;
+            }
+
+            const hasWakeLockApi = !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+            if (!hasWakeLockApi) degrade(DEG.WAKE_LOCK_API_ABSENT);
+            let wakeLockSentinel = null;
+            let wakeLockPending = false;
+
             let visibilityHandler = null;
             let beforeUnloadHandler = null;
             let fullscreenHandler = null;
@@ -353,12 +833,27 @@
             let pageshowHandler = null;
             let locked = false;
 
+            // Only the unprefixed form is specified to return a Promise. Safari below 16.4
+            // returns undefined from webkitRequestFullscreen, so the `.catch()` at every
+            // call site threw a TypeError — and because startLock() is called un-awaited
+            // from onStreamLive(), that rejection silently skipped pointer lock, keyboard
+            // lock and the wake lock for the whole session.
             function enterFullscreen(el) {
-                if (el.requestFullscreen) return el.requestFullscreen();
-                if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
-                if (el.mozRequestFullScreen) return el.mozRequestFullScreen();
-                if (el.msRequestFullscreen) return el.msRequestFullscreen();
-                if (el === video && el.webkitEnterFullscreen) { try { el.webkitEnterFullscreen(); } catch (_) {} }
+                let r;
+                try {
+                    if (el.requestFullscreen) r = el.requestFullscreen();
+                    else if (el.webkitRequestFullscreen) r = el.webkitRequestFullscreen();
+                    else if (el.mozRequestFullScreen) r = el.mozRequestFullScreen();
+                    else if (el.msRequestFullscreen) r = el.msRequestFullscreen();
+                    else if (el === video && el.webkitEnterFullscreen) el.webkitEnterFullscreen();
+                } catch (err) {
+                    degrade(DEG.FULLSCREEN_DENIED);
+                    return Promise.reject(err);
+                }
+                if (r && typeof r.then === 'function') {
+                    return r.then(function () { undegrade(DEG.FULLSCREEN_DENIED); },
+                        function (err) { degrade(DEG.FULLSCREEN_DENIED); throw err; });
+                }
                 return Promise.resolve();
             }
             function currentFullscreenEl() {
@@ -383,24 +878,118 @@
             }
             async function acquireKeyboardLock() {
                 if (navigator.keyboard && navigator.keyboard.lock) {
-                    try { await navigator.keyboard.lock(); } catch (_) {}
+                    try { await navigator.keyboard.lock(); } catch (_) { noteSuppressed(); }
                 }
+            }
+            // Raw, un-accelerated deltas where the platform has them (Chrome 88+ on
+            // Windows/macOS/ChromeOS, Safari 18.4, Firefox 152 — not Linux). Without it the
+            // client's OS applies its own pointer curve and the host applies another, so
+            // the two compound. The option form rejects where unsupported, and the whole
+            // call returns undefined instead of a Promise below Chrome 92 / Safari 18.4.
+            let pointerLockUnadjusted = false;
+            // input.js puts this on the wire as the MOUSE_DELTA flags byte, so the host
+            // knows whether the deltas have already been through an OS pointer curve.
+            // Every assignment goes through here rather than the variable.
+            function setPointerLockUnadjusted(on) {
+                pointerLockUnadjusted = !!on;
+                try {
+                    if (window.RemoteInput && RemoteInput.setPointerLockUnadjusted) {
+                        RemoteInput.setPointerLockUnadjusted(pointerLockUnadjusted);
+                    }
+                } catch (_) { noteSuppressed(); }
             }
             function acquirePointerLock(el) {
                 try {
+                    if (!el.requestPointerLock) {
+                        if (el.mozRequestPointerLock) el.mozRequestPointerLock();
+                        else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
+                        else {
+                            el.style.cursor = 'none'; el.style.userSelect = 'none';
+                            el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none';
+                            el.style.msUserSelect = 'none';
+                            degrade(DEG.POINTER_LOCK_DENIED);
+                        }
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        return;
+                    }
+                    function lockPlain() {
+                        try {
+                            const q = el.requestPointerLock();
+                            if (q && q.catch) q.catch(function () { degrade(DEG.POINTER_LOCK_DENIED); });
+                        } catch (_) { degrade(DEG.POINTER_LOCK_DENIED); }
+                    }
                     let p = null;
-                    if (el.requestPointerLock) p = el.requestPointerLock();
-                    else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
-                    else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
-                    else { el.style.cursor = 'none'; el.style.userSelect = 'none'; el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none'; el.style.msUserSelect = 'none'; }
-                    if (p && p.catch) p.catch(() => {});
-                } catch (_) {}
+                    let threw = false;
+                    try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { threw = true; }
+                    if (threw) {
+                        // The options bag was rejected outright, so *no lock was requested at
+                        // all*. Without the plain retry, relative movement was dead for the
+                        // whole session and every mouse move went down the absolute path.
+                        noteSuppressed();
+                        setPointerLockUnadjusted(false);
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        lockPlain();
+                        return;
+                    }
+                    if (p && typeof p.then === 'function') {
+                        // Set on fulfilment, not on the mere fact that a Promise came back: an
+                        // engine that returns one and ignores unknown dictionary members
+                        // resolves normally, and reporting raw deltas we are not getting is
+                        // worse than reporting none.
+                        p.then(function () {
+                            setPointerLockUnadjusted(true);
+                            undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        }, function () {
+                            setPointerLockUnadjusted(false);
+                            degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                            lockPlain();
+                        });
+                        return;
+                    }
+                    // No Promise came back. Chrome 88-110 honours unadjustedMovement and still
+                    // returns undefined, so this is genuinely unknown rather than unavailable —
+                    // but the bit is the only channel there is, and over-reporting raw deltas
+                    // is the more misleading of the two.
+                    degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                    setPointerLockUnadjusted(false);
+                } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
+            }
+
+            async function acquireWakeLock() {
+                if (!hasWakeLockApi || wakeLockPending) return false;
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                wakeLockPending = true;
+                try {
+                    wakeLockSentinel = await navigator.wakeLock.request('screen');
+                    undegrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel.addEventListener('release', function () { wakeLockSentinel = null; });
+                    return true;
+                } catch (_) {
+                    degrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel = null;
+                    return false;
+                } finally {
+                    wakeLockPending = false;
+                }
+            }
+            function releaseWakeLock() {
+                const s = wakeLockSentinel;
+                wakeLockSentinel = null;
+                if (!s) return;
+                try { const p = s.release(); if (p && p.catch) p.catch(noteSuppressed); } catch (_) { noteSuppressed(); }
+            }
+            function wakeLockHeld() {
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                return !!(noSleepImpl && noSleepImpl.isEnabled);
             }
 
             function installGestureHandler() {
                 if (gestureHandler) return;
                 gestureHandler = () => {
                     if (!locked) return;
+                    // A dialog is up, or this tap is the one that opens the queued output
+                    // picker: either way the user is reaching for the page, not for the stage.
+                    if (modalSuspend || pickerGestureArmed) return;
                     if (!fullscreenMode) {
                         if (!document.pointerLockElement) acquirePointerLock(stage);
                         return;
@@ -430,12 +1019,51 @@
                 viewportModeActive = false;
             }
 
-            function enableNoSleep() {
+            function disableNoSleep() {
+                releaseWakeLock();
+                if (!noSleepImpl) return;
+                try { noSleepImpl.disable(); } catch (_) { noteSuppressed(); }
+            }
+
+            // Safari added `navigator.wakeLock` in 16.4 but a standalone home-screen app is the
+            // documented case where the request fulfils and the screen sleeps anyway. Probing
+            // for the constructor and stopping at "it resolved" therefore made the shim
+            // unreachable on exactly the devices the comment below names. There is nothing to
+            // feature-detect — the API reports success — so the shim runs *beneath* the wake
+            // lock there rather than only on refusal. It costs one muted looping clip.
+            function standaloneApp() {
                 try {
-                    if (noSleep.isEnabled) return;
-                    const p = noSleep.enable();
-                    if (p && p.catch) p.catch(() => {});
-                } catch (_) {}
+                    if (navigator.standalone === true) return true;
+                    if (window.matchMedia) return window.matchMedia('(display-mode: standalone)').matches;
+                } catch (_) { noteSuppressed(); }
+                return false;
+            }
+
+            // Tiered: the real Wake Lock API first, the looping-video shim where it is missing,
+            // refuses, or is known not to hold the screen. On iOS below 18.4 (and in a
+            // standalone home-screen app even at 18.4) the shim is still the only thing that
+            // works.
+            function enableNoSleep() {
+                if (hasWakeLockApi) {
+                    const alsoShim = standaloneApp();
+                    if (alsoShim) enableNoSleepShim();
+                    acquireWakeLock().then(function (ok) {
+                        if (ok) { if (!locked) releaseWakeLock(); return; }
+                        if (!alsoShim) enableNoSleepShim();
+                    }, function () { if (!alsoShim) enableNoSleepShim(); });
+                    return;
+                }
+                enableNoSleepShim();
+            }
+
+            function enableNoSleepShim() {
+                const ns = getNoSleep();
+                if (!ns) return;
+                try {
+                    if (ns.isEnabled) return;
+                    const p = ns.enable();
+                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => { degrade(DEG.WAKE_LOCK_REFUSED); });
+                } catch (_) { noteSuppressed(); degrade(DEG.WAKE_LOCK_REFUSED); }
             }
 
             async function startLock() {
@@ -449,9 +1077,15 @@
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
-                    if (!fullscreenMode) return;
-                    await acquireKeyboardLock();
-                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
+                    // iOS suspends the context when the page is backgrounded and nothing
+                    // resumed it: the picture came back and the audio did not.
+                    try { if (window.SEAudio) SEAudio.resume(); } catch (_) { noteSuppressed(); }
+                    if (!fullscreenMode || modalSuspend) return;
+                    // Fullscreen first: navigator.keyboard.lock() is specified to reject
+                    // outside it, so asking on the way back from the background asked at the
+                    // one moment it could not succeed and the rejection was swallowed.
+                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); } }
+                    if (currentFullscreenEl()) await acquireKeyboardLock();
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
 
@@ -470,7 +1104,7 @@
                 const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
                 if (fullscreenHandler) fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
                 fullscreenHandler = async () => {
-                    if (!locked) return;
+                    if (!locked || modalSuspend) return;
                     if (currentFullscreenEl()) {
                         exitViewportMode();
                         clearViewportSize();
@@ -479,7 +1113,7 @@
                         enableNoSleep();
                     } else {
                         enterViewportMode();
-                        try { await enterFullscreen(fullscreenTarget()); } catch (_) {}
+                        try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); }
                     }
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
@@ -510,7 +1144,7 @@
 
                 if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
 
-                noSleep.disable();
+                disableNoSleep();
 
                 if (document.exitPointerLock) document.exitPointerLock();
                 else if (document.mozExitPointerLock) document.mozExitPointerLock();
@@ -523,25 +1157,271 @@
                         else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
                         else if (document.mozCancelFullScreen) await document.mozCancelFullScreen();
                         else if (document.msExitFullscreen) await document.msExitFullscreen();
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
                 }
+            }
+
+            // Anything this page puts in front of the user — a modal, a card, or the browser's
+            // own output picker — is unreachable while the session still owns the input. The
+            // pointer is locked to the stage, so the cursor the user is looking for does not
+            // exist; the keyboard is locked, so Esc and Tab go to the host; and every click
+            // lands on the host's desktop instead of on the button. The only way to answer a
+            // card was from devtools.
+            //
+            // So a dialog takes the input back first: leave fullscreen (a fullscreen element
+            // renders only its own subtree, so a sibling modal is invisible inside one), drop
+            // pointer lock, unlock the keyboard, and tell the host focus is gone so it releases
+            // any modifier it is holding down. The gesture handler stands down for the duration
+            // rather than re-taking all three on the very tap that dismisses the dialog; the
+            // next tap after that re-enters, which is the path Esc already takes.
+            let modalDepth = 0;
+            let modalSuspend = false;
+            function exitPointerLockNow() {
+                try {
+                    if (document.exitPointerLock) document.exitPointerLock();
+                    else if (document.mozExitPointerLock) document.mozExitPointerLock();
+                    else if (document.webkitExitPointerLock) document.webkitExitPointerLock();
+                } catch (_) { noteSuppressed(); }
+            }
+            function exitFullscreenNow() {
+                if (!currentFullscreenEl()) return;
+                try {
+                    let p = null;
+                    if (document.exitFullscreen) p = document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) p = document.webkitExitFullscreen();
+                    else if (document.mozCancelFullScreen) p = document.mozCancelFullScreen();
+                    else if (document.msExitFullscreen) p = document.msExitFullscreen();
+                    if (p && p.catch) p.catch(noteSuppressed);
+                } catch (_) { noteSuppressed(); }
+            }
+            function beginModal() {
+                modalDepth++;
+                if (modalDepth > 1) return;
+                modalSuspend = true;
+                let suspended = false;
+                try {
+                    if (window.RemoteInput && RemoteInput.setSuspended) suspended = !!RemoteInput.setSuspended(true);
+                } catch (_) { noteSuppressed(); }
+                // Only a session that was actually forwarding input has anything to report; a
+                // card raised on the join form suspended nothing.
+                if (suspended) degrade(DEG.INPUT_SUSPENDED_FOR_MODAL);
+                exitPointerLockNow();
+                try {
+                    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+                } catch (_) { noteSuppressed(); }
+                exitFullscreenNow();
+            }
+            function endModal() {
+                if (modalDepth === 0) return;
+                modalDepth--;
+                if (modalDepth > 0) return;
+                modalSuspend = false;
+                try {
+                    if (window.RemoteInput && RemoteInput.setSuspended) RemoteInput.setSuspended(false);
+                } catch (_) { noteSuppressed(); }
+            }
+            // `beginModal()` only *starts* the release: a pointer-lock exit is delivered on
+            // `pointerlockchange` and a fullscreen exit on `fullscreenchange`, both in a later
+            // task, and `webkitExitFullscreen` returns nothing at all. A page modal is a sibling
+            // of `#stage`, so revealing it while the fullscreen element is still `#stage` shows
+            // the user nothing — which is the failure this whole mechanism exists to fix. So the
+            // dialog is revealed from the confirmation, under the same 1500 ms fallback the
+            // deleted `offerPermModalNow` carried: an exit that never lands must not strand the
+            // caller with an invisible dialog and the input still suspended.
+            const MODAL_RELEASE_MS = 1500;
+            const MODAL_RELEASE_EVENTS = ['fullscreenchange', 'webkitfullscreenchange',
+                'mozfullscreenchange', 'MSFullscreenChange', 'pointerlockchange',
+                'mozpointerlockchange', 'webkitpointerlockchange'];
+            function inputReleased() {
+                return !currentFullscreenEl() && !document.pointerLockElement;
+            }
+            function whenInputReleased(cb) {
+                const run = () => { try { cb(); } catch (_) { noteSuppressed(); } };
+                if (inputReleased()) { run(); return; }
+                let settled = false;
+                let timer = 0;
+                const check = () => { if (inputReleased()) finish(); };
+                function finish() {
+                    if (settled) return;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    MODAL_RELEASE_EVENTS.forEach((ev) => document.removeEventListener(ev, check));
+                    run();
+                }
+                MODAL_RELEASE_EVENTS.forEach((ev) => document.addEventListener(ev, check));
+                timer = setTimeout(finish, MODAL_RELEASE_MS);
+            }
+            // Wraps anything that puts UI in front of the user. `fn` is handed a `done` callback
+            // it must call exactly once; the counter tolerates being unbalanced only downwards.
+            // `immediate` is for UI the *browser* draws — the output picker — which is not a
+            // subtree of the page, so no fullscreen exit has to have landed for it to be
+            // visible, and which must run inside the gesture's transient activation rather than
+            // a task later.
+            function withModal(fn, immediate) {
+                beginModal();
+                let closed = false;
+                const done = () => { if (closed) return; closed = true; endModal(); };
+                const body = () => { try { fn(done); } catch (_) { noteSuppressed(); done(); } };
+                if (immediate) body(); else whenInputReleased(body);
+            }
+
+            // The host asked this device to play somewhere and the engine refused it outright —
+            // no `setSinkId`, or it rejected. On an engine with `selectAudioOutput()` there is
+            // exactly one thing left to try, and it needs transient activation, so it waits for
+            // the user's next tap or key rather than being raised over the picture. One request
+            // is armed at a time; a newer host choice replaces the id it will open on.
+            let queuedPickerId = null;
+            let lastOfferedSinkId = null;
+            // The sink the audio graph is already playing on, so `/reconfig` can command it once
+            // per change rather than once per poll. Cleared whenever the graph goes, because the
+            // next one starts on the device's default and has to be told again.
+            let appliedSinkId = null;
+            let pickerGestureArmed = false;
+            let pickerGestureFire = null;
+            // No `keydown`. `input.js` binds its own on `window` in the capture phase during
+            // `setup()`, i.e. before this one, so it would run first with `suspended` still
+            // false and the key that summons the dialog would land on the host's desktop —
+            // possibly a modifier, possibly something destructive. A tap is a sufficient
+            // gesture, and the stage is the thing being tapped. `pointerdown`/`touchend` are
+            // safe because input.js binds those on `#stage` in the bubble phase, so this
+            // window-capture listener wins.
+            const PICKER_GESTURES = ['pointerdown', 'touchend'];
+            // A browser chooser can be left open indefinitely — a backgrounded tab, an engine
+            // that resolves neither way — and everything downstream of it waits on it settling.
+            // Every other promise on the join path is bounded; this one is too.
+            const PICKER_DEADLINE_MS = 15000;
+            function pickOutputBounded(preferredId, onSettled) {
+                let settled = false;
+                let timer = 0;
+                const finish = (chosen) => {
+                    if (settled) return null;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
+                    return chosen || null;
+                };
+                // Synchronous, inside the gesture: the activation this depends on is spent by
+                // the first await, not by anything above it.
+                let p = null;
+                try { p = SEAudio.pickOutput(preferredId); } catch (_) { noteSuppressed(); }
+                return new Promise((resolve) => {
+                    timer = setTimeout(function () {
+                        timer = 0;
+                        noteSuppressed();
+                        resolve(finish(null));
+                    }, PICKER_DEADLINE_MS);
+                    Promise.resolve(p).then(
+                        (chosen) => resolve(finish(chosen)),
+                        () => { noteSuppressed(); resolve(finish(null)); });
+                });
+            }
+            function cancelQueuedPicker() {
+                queuedPickerId = null;
+                lastOfferedSinkId = null;
+                if (!pickerGestureFire) return;
+                const fn = pickerGestureFire;
+                pickerGestureFire = null;
+                pickerGestureArmed = false;
+                PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fn, true));
+            }
+            function queueOutputPicker(preferredId) {
+                let can = false;
+                try { can = !!(window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()); } catch (_) { noteSuppressed(); }
+                if (!can) {
+                    // Nothing left to offer. `sinkTier` staying 0 after a change the host asked
+                    // for is what says so, and it already does. Behind the caller's id latch,
+                    // so this is once per sink the host asks for, not once a second.
+                    console.warn('[audio] the host asked for an output this browser will not route to');
+                    return;
+                }
+                queuedPickerId = preferredId || '';
+                if (pickerGestureArmed) return;
+                pickerGestureArmed = true;
+                const fire = () => {
+                    PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fire, true));
+                    pickerGestureArmed = false;
+                    pickerGestureFire = null;
+                    const want = queuedPickerId;
+                    queuedPickerId = null;
+                    withModal((close) => {
+                        pickOutputBounded(want, close).then((chosen) => {
+                            if (chosen) console.log('[audio] output re-selected: ' + (chosen.label || chosen.id));
+                        }, noteSuppressed);
+                    }, true);
+                };
+                pickerGestureFire = fire;
+                PICKER_GESTURES.forEach((ev) => window.addEventListener(ev, fire, true));
             }
 
             let leaveSent = false;
             function sendLeave() {
                 if (leaveSent || !isLive || reconfiguring) return;
                 leaveSent = true;
-                try { navigator.sendBeacon('/leave'); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                releaseJoin();
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
             }
             window.addEventListener('pagehide', sendLeave);
 
-            async function getIceServers() {
+            // `/ice-config` answers with the servers *and* the host's own view of where this
+            // client is, which is the only reliable source for whether the session will be
+            // relayed. An older host sends no `locality` field; `unknown` is then the honest
+            // answer and the wait falls back to reading the server list, which is what this
+            // page did before the field existed.
+            async function getIceConfig() {
                 try {
                     const r = await fetch('/ice-config');
-                    if (r.ok) return (await r.json()).iceServers || [];
-                } catch (_) {}
-                return [];
+                    if (r.ok) {
+                        const j = await r.json();
+                        return {
+                            iceServers: (j && j.iceServers) || [],
+                            locality: (j && typeof j.locality === 'string') ? j.locality : 'unknown',
+                        };
+                    }
+                } catch (_) { noteSuppressed(); }
+                return { iceServers: [], locality: 'unknown' };
+            }
+
+            // `/net-config` is read by the HTTPS upsell and by the join, so it is fetched once
+            // and shared. Priming it at load is what keeps it off the join path: by the time
+            // Connect is pressed the answer is already here, and the trickle decision costs a
+            // property read rather than a round trip.
+            // Only a *successful* body is memoised. A page that raced the server coming up, or a
+            // single dropped request, would otherwise be pinned for its whole life to "no trickle
+            // and port 8443" — and this is primed at module scope, which is exactly the moment
+            // that race is most likely.
+            let netConfigPromise = null;
+            function getNetConfig() {
+                if (!netConfigPromise) {
+                    const attempt = fetch('/net-config').then(function (r) {
+                        if (!r.ok) throw new Error('/net-config ' + r.status);
+                        return r.json();
+                    }).then(function (j) {
+                        if (!j || typeof j !== 'object') throw new Error('/net-config is not an object');
+                        return j;
+                    }).catch(function () {
+                        noteSuppressed();
+                        if (netConfigPromise === attempt) netConfigPromise = null;
+                        return {};
+                    });
+                    netConfigPromise = attempt;
+                }
+                return netConfigPromise;
+            }
+            // Guarded because this is module scope: a browser with no `fetch` cannot reach any
+            // fast path on this page anyway, but a throw here would take the join form with it.
+            if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
+
+            // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
+            // waiting for one is only right when nothing else can carry the session. The host
+            // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
+            // the list" is not the question. On a LAN the host candidate is what gets nominated,
+            // it arrives in milliseconds, and refusing to end the wait on it cost every join on a
+            // TURN-configured host the difference; a TURN server that is merely unreachable cost
+            // the whole 6 s deadline before the WHEP POST was even sent.
+            function relayNeeded(cfg) {
+                if (cfg.locality === 'same-network') return false;
+                if (cfg.locality === 'cross-network') return hasTurnServer(cfg.iceServers);
+                return hasTurnServer(cfg.iceServers);
             }
 
             function hasTurnServer(iceServers) {
@@ -551,18 +1431,275 @@
                     return arr.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
                 });
             }
-            function waitForIceGathering(pc, timeoutMs) {
+            // WHEP is a single POST, so the offer has to carry every candidate we intend to
+            // use — there is no PATCH to trickle them in later. That does not mean waiting
+            // for gathering to *finish*: on a LAN the host candidates are the ones that will
+            // be nominated, they arrive in the first few milliseconds, and everything after
+            // them is a STUN round trip whose result the connection will never use. So the
+            // wait ends a short grace period after the last useful candidate rather than at
+            // the full deadline, and the deadline is only reached when nothing arrived.
+            const ICE_HOST_GRACE_MS = 200;
+            const ICE_RELAY_GRACE_MS = 400;
+            // Split out so it can be asserted without a browser — scripts/test-client-ice.mjs
+            // extracts these three from this file and drives them directly. The gating is the
+            // whole correctness of a TURN join: on a relayed session a host candidate must not
+            // end the wait, because the relay allocation is a full round trip behind it and
+            // WHEP has no PATCH to trickle it in afterwards.
+            function iceCandidateType(c) {
+                if (!c) return '';
+                if (c.type) return c.type;
+                const m = / typ (\w+)/.exec(c.candidate || '');
+                return (m && m[1]) || '';
+            }
+            function iceGraceFor(type, needRelay) {
+                if (needRelay) return type === 'relay' ? ICE_RELAY_GRACE_MS : 0;
+                return (type === 'host' || type === 'srflx') ? ICE_HOST_GRACE_MS : 0;
+            }
+            function waitForIceGathering(pc, timeoutMs, needRelay) {
                 if (pc.iceGatheringState === 'complete') return Promise.resolve();
                 return new Promise((resolve) => {
-                    const check = () => {
-                        if (pc.iceGatheringState === 'complete') {
-                            pc.removeEventListener('icegatheringstatechange', check);
-                            resolve();
-                        }
-                    };
-                    pc.addEventListener('icegatheringstatechange', check);
-                    setTimeout(resolve, timeoutMs || 3000);
+                    let settled = false;
+                    let graceTimer = 0;
+                    const deadline = setTimeout(() => {
+                        if (pc.iceGatheringState !== 'complete') degrade(DEG.ICE_GATHERING_DEADLINE);
+                        finish();
+                    }, timeoutMs || 3000);
+                    function finish() {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(deadline);
+                        if (graceTimer) clearTimeout(graceTimer);
+                        pc.removeEventListener('icegatheringstatechange', onState);
+                        pc.removeEventListener('icecandidate', onCandidate);
+                        resolve();
+                    }
+                    function arm(ms) {
+                        if (graceTimer) clearTimeout(graceTimer);
+                        graceTimer = setTimeout(finish, ms);
+                    }
+                    function onState() { if (pc.iceGatheringState === 'complete') finish(); }
+                    function onCandidate(ev) {
+                        const c = ev.candidate;
+                        if (!c || !c.candidate) { finish(); return; }
+                        const ms = iceGraceFor(iceCandidateType(c), needRelay);
+                        if (ms) arm(ms);
+                    }
+                    pc.addEventListener('icegatheringstatechange', onState);
+                    pc.addEventListener('icecandidate', onCandidate);
                 });
+            }
+
+            // Trickle ICE, RFC 9725 §4.6. The wait above is the whole reason a relayed join is
+            // slow: the offer is a single POST, so every candidate the session will ever use has
+            // to be in it, and a TURN allocation is a full round trip. A host that answers with a
+            // `Location` takes the rest by PATCH, so the offer can leave the moment it exists.
+            //
+            // Both halves are probed and neither is assumed. `/net-config`'s `trickleIce` decides
+            // whether to skip the wait; the `Location` header on the answer decides whether
+            // anything is actually sent. A host without either keeps the gather-then-post shape
+            // byte for byte, which is what every shipped host does.
+            const TRICKLE_MAX_BATCH = 24;
+            // How long the first PATCH has to be acknowledged. A verb a proxy rejects outright
+            // answers inside two round trips and the status says so; one that is black-holed
+            // never answers at all, and this is the only thing that notices.
+            const TRICKLE_FIRST_ACK_MS = 2000;
+            // Statuses that mean this verb will never work here, however many times it is tried:
+            // a proxy that does not route PATCH, a WAF that rejects the media type, a gateway
+            // that forbids it. 404 is not one of them — that is the session being over.
+            function trickleIsFatal(status) {
+                return status === 403 || status === 405 || status === 415 || status === 501;
+            }
+            let trickleOff = false;
+            let trickleSender = null;
+
+            function localIceUfrag(peer) {
+                try {
+                    const d = peer.localDescription;
+                    const m = /a=ice-ufrag:(\S+)/.exec((d && d.sdp) || '');
+                    return (m && m[1]) || '';
+                } catch (_) { noteSuppressed(); return ''; }
+            }
+
+            // An `application/trickle-ice-sdpfrag` body: a partial SDP, no library needed. One
+            // `m=` section for the batch — the page is `max-bundle`, so every candidate belongs
+            // to the first media section — and the mid beside it, which is what the host prefers
+            // over the m-line index it counts.
+            function trickleFragment(ufrag, cands, end) {
+                let body = '';
+                if (ufrag) body += 'a=ice-ufrag:' + ufrag + '\r\n';
+                if (cands.length) {
+                    body += 'm=video 9 UDP/TLS/RTP/SAVPF 0\r\n';
+                    const mid = cands[0].sdpMid;
+                    if (mid) body += 'a=mid:' + mid + '\r\n';
+                    for (let i = 0; i < cands.length; i++) {
+                        const line = cands[i].candidate;
+                        body += 'a=' + (line.indexOf('candidate:') === 0 ? line : 'candidate:' + line) + '\r\n';
+                    }
+                }
+                if (end) body += 'a=end-of-candidates\r\n';
+                return body;
+            }
+
+            // Buffers from the moment the offer exists, because gathering starts there and the
+            // resource URL only arrives with the answer: a candidate produced in between is one
+            // the host would otherwise never see.
+            function startTrickle(peer, onDead, onSettled) {
+                const queue = [];
+                let url = null;
+                let ended = false;
+                let closed = false;
+                let flushing = false;
+                let posted = '';
+                let sentCount = 0;
+                let attempts = 0;
+                let failStreak = 0;
+                let ackTimer = 0;
+                let deadCalled = false;
+                let settled = false;
+
+                function onCandidate(ev) {
+                    if (closed) return;
+                    const c = ev.candidate;
+                    if (!c || !c.candidate) ended = true;
+                    else queue.push(c);
+                    flush();
+                }
+
+                // The end of gathering has two signals and the page must accept either. Waiting
+                // only for the null candidate made the whole sender depend on one event: a
+                // browser that reports completion through the state alone, or one whose null
+                // candidate landed in the task before this listener was attached, never sets
+                // `ended`, never sends `a=end-of-candidates`, and therefore never settles — and
+                // the page then holds the streaming stage for the full deadline and reports a
+                // gathering timeout on a session that gathered perfectly well. Measured on
+                // Chrome 141/Windows: `icegatheringstatechange` to `complete` is dispatched
+                // *before* the null candidate, so this is also the earlier of the two.
+                function onGathering() {
+                    if (closed) return;
+                    if (peer.iceGatheringState !== 'complete') return;
+                    ended = true;
+                    flush();
+                }
+
+                function quiesce() {
+                    if (closed) return;
+                    closed = true;
+                    queue.length = 0;
+                    if (ackTimer) { clearTimeout(ackTimer); ackTimer = 0; }
+                    try { peer.removeEventListener('icecandidate', onCandidate); } catch (_) { noteSuppressed(); }
+                    try { peer.removeEventListener('icegatheringstatechange', onGathering); } catch (_) { noteSuppressed(); }
+                }
+
+                // "This sender will send nothing more", whichever way it got there: the final
+                // batch carrying `a=end-of-candidates` was acknowledged, the session is gone, or
+                // the verb is refused. The page holds the streaming stage back until this fires,
+                // so that a rejoin with a gathered offer can only ever happen *before* there is
+                // a picture — never behind one the user is already using.
+                function settle() {
+                    if (settled) return;
+                    settled = true;
+                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
+                }
+
+                function stop() { quiesce(); settle(); }
+
+                // Nothing this sender carries ever reached the host, and the offer that was
+                // posted carries no candidates either — so the session cannot connect and the
+                // page has to be told, once. Everything else about the sender stops here too:
+                // there is no third thing to try. `onDead` runs before the settle so a rejoin
+                // replaces the gate rather than racing it.
+                function dead(reason) {
+                    if (deadCalled) return;
+                    deadCalled = true;
+                    quiesce();
+                    try { if (onDead) onDead(reason); } catch (_) { noteSuppressed(); }
+                    settle();
+                }
+
+                function flush() {
+                    if (closed || !url || flushing) return;
+                    // A candidate the offer already carried would be added a second time and
+                    // the host has no way to tell the copy apart, so it would build a duplicate
+                    // pair for it. Filtered across the whole queue rather than off its head:
+                    // that the duplicates all precede the fresh ones is a property of how the
+                    // browser fills `localDescription`, not of anything here.
+                    const batch = [];
+                    while (queue.length && batch.length < TRICKLE_MAX_BATCH) {
+                        const c = queue.shift();
+                        if (posted.indexOf(c.candidate) < 0) batch.push(c);
+                    }
+                    const done = ended && !queue.length;
+                    if (!batch.length && !done) return;
+                    const ufrag = (batch.length && batch[0].usernameFragment) || localIceUfrag(peer);
+                    let requeued = false;
+                    // One retry, then give up on the batch. A candidate lost to a transient
+                    // failure can be the relay one, and PATCH is the only way it ever reaches the
+                    // host — but a second failure in a row is the endpoint, not the packet, and
+                    // an endpoint that refuses this verb refuses every batch, which is why giving
+                    // up is `dead()` and not a silent drop.
+                    function requeue(reason) {
+                        noteSuppressed();
+                        if (failStreak++ > 0) { dead(reason); return; }
+                        requeued = true;
+                        for (let i = batch.length - 1; i >= 0; i--) queue.unshift(batch[i]);
+                    }
+                    flushing = true;
+                    attempts++;
+                    // The device token is the second factor on the resource. It used to be the
+                    // peer's address, which a roam or a lease renewal changed under a live
+                    // session — so a client that had done nothing wrong lost trickle mid-join.
+                    const patchHeaders = { 'Content-Type': 'application/trickle-ice-sdpfrag' };
+                    const patchToken = readDeviceToken();
+                    if (patchToken) patchHeaders['X-Device-Token'] = patchToken;
+                    fetch(url, {
+                        method: 'PATCH',
+                        headers: patchHeaders,
+                        body: trickleFragment(ufrag, batch, done),
+                    }).then(function (r) {
+                        // 404 is the session being over, not a transport failure: there is
+                        // nothing left to send it to, and nothing a rejoin would fix.
+                        if (r.status === 404) { stop(); return; }
+                        if (trickleIsFatal(r.status)) { dead('PATCH ' + r.status); return; }
+                        if (r.ok) {
+                            sentCount += batch.length;
+                            failStreak = 0;
+                            if (ackTimer) { clearTimeout(ackTimer); ackTimer = 0; }
+                            return;
+                        }
+                        requeue('PATCH ' + r.status);
+                    }, function () {
+                        requeue('PATCH did not complete');
+                    }).then(function () {
+                        flushing = false;
+                        if (closed) return;
+                        if (done && !requeued) stop(); else flush();
+                    });
+                }
+
+                peer.addEventListener('icecandidate', onCandidate);
+                peer.addEventListener('icegatheringstatechange', onGathering);
+                // Gathering can already be over by the time this runs — the sender is built one
+                // task after `setLocalDescription` resolves — and a state that is already
+                // `complete` fires no further event.
+                onGathering();
+                return {
+                    // `offerSdp` is the offer as it went out, not `localDescription` as it reads
+                    // later — that one keeps growing as candidates are gathered.
+                    open: function (resourceUrl, offerSdp) {
+                        url = resourceUrl;
+                        posted = offerSdp || '';
+                        // A PATCH that is answered with a status can be acted on; one that is
+                        // black-holed never settles, and then nothing above ever runs again.
+                        ackTimer = setTimeout(function () {
+                            ackTimer = 0;
+                            if (closed || sentCount > 0 || attempts === 0) return;
+                            dead('no PATCH acknowledged in ' + TRICKLE_FIRST_ACK_MS + ' ms');
+                        }, TRICKLE_FIRST_ACK_MS);
+                        flush();
+                    },
+                    stop: stop,
+                    count: function () { return sentCount; },
+                };
             }
 
             function tryPlay() {
@@ -575,26 +1712,154 @@
                 }
             }
 
-            function teardownSession() {
+            // Bumped by every teardown, checked by start() after each of its awaits. start()
+            // reads and writes pc, worker and usingFallback across seven suspension points and
+            // both watchdogs can tear the session down inside one of them; without a token the
+            // resumed call would POST a second /whep for the same device and hand the fresh
+            // connection the previous one's answer.
+            let startGen = 0;
+
+            // `keepJoin` is the difference between renegotiating and leaving.
+            //
+            // Every rejoin on this page — a reconfigure, a demotion to <video>, the legacy
+            // transform, a trickle latch — goes through here and calls `start()` again. Those
+            // are the *same* session continuing: the page offers again, presents the join id it
+            // already holds, and the host keeps the session and the virtual display it created.
+            // Releasing it instead is what made a settings change look like a disconnect — the
+            // host removed the display, the dashboard raised "device left" and then "device
+            // joined", and every window the user had on that display was shuffled back onto the
+            // primary monitor before a brand-new display appeared.
+            //
+            // Without `keepJoin` this is a departure: the host takes the display down now rather
+            // than after the disconnect grace. Only two things want that — the page going away
+            // (`pagehide`) and a session the host has already ended (`kickDevice`). A lost link
+            // is not one of them: the page is still open and still offering to reconnect, and the
+            // grace is precisely the mechanism for that.
+            function teardownSession(keepJoin) {
+                startGen++;
+                if (!keepJoin) releaseJoin();
+                releaseIceHold();
+                iceEverConnected = false;
+                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
+                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
-                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
+                if (reconfigPoll) { clearTimeout(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
-                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
+                videoWorkerStats = null;
+                stopFallbackFrameStats();
+                if (trickleSender) { trickleSender.stop(); trickleSender = null; }
+                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
+                appliedSinkId = null;
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
+            }
+
+            let transformStarted = false;
+            let transformWatchdog = null;
+
+            // One step down, not all the way: losing RTCRtpScriptTransform costs the
+            // keyframe request, losing WebCodecs entirely costs the whole jitter buffer
+            // (~90 ms) as well.
+            function retryWithLegacyTransform(reason) {
+                if (forceLegacyTransform || !hasLegacyEncodedStreams) {
+                    fallbackToVideo(reason);
+                    return;
+                }
+                forceLegacyTransform = true;
+                degrade(DEG.TRANSFORM_FELL_BACK_TO_LEGACY);
+                console.warn('falling back to createEncodedStreams:', reason);
+                start(true, true);
+            }
+
+            // Trickle was advertised and then did not work: the resource was missing, the verb
+            // was refused, or nothing was ever acknowledged. The offer that went out carries no
+            // candidates, so unless ICE has already come up there is nothing to salvage — latch
+            // trickle off for the page and join again with a gathered offer. `trickleOff` is
+            // never cleared, so this happens at most once per page load and a manual reconnect
+            // does not repeat it.
+            function trickleFailed(reason, preferWebCodecs) {
+                if (trickleOff) return;
+                trickleOff = true;
+                degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                console.warn('[ice] trickled candidates are not reaching the host (' + reason + ')');
+                // Enough candidates got through before this to nominate a pair, so tearing the
+                // session down would cost more than the latch is worth and the latch is all the
+                // next join needs. The test is the *current* peer connection, not `isLive`: a
+                // reconfigure keeps the old picture on screen while the new connection is still
+                // negotiating, and that one does need the rejoin.
+                const connected = iceEverConnected || (!!pc && (pc.connectionState === 'connected'
+                    || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed'));
+                if (connected) return;
+                console.warn('[ice] rejoining with a gathered offer');
+                // No `/leave` and no `DELETE` first, deliberately: `start_session` stops the
+                // previous capture for this client before it starts a new one, so a replacement
+                // join is the host's own designed path, and signalling a leave would set the
+                // teardown running *concurrently* with the display the rejoin is creating. The
+                // two sibling rungs — `fallbackToVideo` and `retryWithLegacyTransform` — rejoin
+                // the same way for the same reason. All three present the join id they already
+                // hold, so the host reuses the session and its display rather than building a
+                // second one beside it.
+                start(preferWebCodecs, true);
             }
 
             function fallbackToVideo(reason) {
                 if (usingFallback) return;
                 usingFallback = true;
+                degrade(DEG.DEMOTED_TO_VIDEO);
                 console.warn('falling back to <video>:', reason);
-                teardownSession();
-                start(false);
+                start(false, true);
+            }
+
+            // Presentation tier 2: decoded frames written into a track generator and played
+            // by the <video> element, which on some platforms lets the compositor take a
+            // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
+            // public measurement says the overlay actually happens, and the constructor
+            // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
+            // Runs from inside the worker's onmessage, where a throw is swallowed by the
+            // event loop and leaves the page with no video sink at all: no canvas, no
+            // generator, and a <video> nothing writes to. transferControlToOffscreen can
+            // throw — every other call of it is inside a try for exactly that reason.
+            function useCanvasInstead() {
+                try {
+                    if (worker) {
+                        const off = freshCanvas().transferControlToOffscreen();
+                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                    }
+                    showCanvas();
+                } catch (err) {
+                    noteSuppressed();
+                    degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+                    fallbackToVideo('canvas transfer failed: ' + err);
+                }
+            }
+            function attachTrackGenerator(track) {
+                if (!track) {
+                    console.warn('[webcodecs] track generator unavailable; using the canvas');
+                    useCanvasInstead();
+                    return;
+                }
+                try {
+                    video.srcObject = new MediaStream([track]);
+                    showVideo();
+                    startFallbackFrameStats();
+                    tryPlay();
+                } catch (err) {
+                    noteSuppressed();
+                    console.warn('[webcodecs] track generator attach failed:', err);
+                    // Without the canvas transfer the worker has no sink at all: it kept
+                    // writing into a generator attached to nothing and the page showed black.
+                    useCanvasInstead();
+                }
             }
 
             async function handleRenderCount(n) {
+                // pc.getStats() is a suspension point, and both watchdogs tear the session down
+                // and rebuild it from inside one. Without this the resumed call demotes the
+                // *new* session on the old one's stall count.
+                const gen = startGen;
                 let bytes = -1;
                 try {
                     if (pc) {
@@ -605,15 +1870,32 @@
                             }
                         });
                     }
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
+                if (gen !== startGen) { noteSuppressed(); return; }
                 const rendersAdvanced = n !== lastRendered;
                 const knowBytes = bytes >= 0;
                 const bytesAdvanced = knowBytes && bytes !== lastBytes;
                 lastRendered = n;
                 if (knowBytes) lastBytes = bytes;
+                if (rendersAdvanced || bytesAdvanced) markAlive();
                 if (rendersAdvanced) { renderStalls = 0; return; }
                 if (bytesAdvanced) {
-                    if (++renderStalls >= 2) fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    renderStalls++;
+                    // Ask for a keyframe first — that is what a stall usually needs, and
+                    // until this page could ask, the only remedy was to throw the whole
+                    // fast path away and take the jitter buffer back.
+                    // Nothing below reads the reply — the keyTier two lines down comes
+                    // from the once-a-second `videostats` message — so this only ever
+                    // fed a console.log, once every two seconds, for the whole of a
+                    // stall, on a page whose other diagnostics are behind ?debug.
+                    if (DEBUG && worker) worker.postMessage({ type: 'stats' });
+                    let asked = false;
+                    try { asked = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                    const keyTier = (videoWorkerStats && videoWorkerStats.keyTier) || 0;
+                    const canAsk = asked || keyTier === 1;
+                    if (renderStalls >= (canAsk ? 4 : 2)) {
+                        fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    }
                 } else {
                     renderStalls = 0;
                 }
@@ -637,6 +1919,231 @@
                 return null;
             }
 
+            // ---------------------------------------------------------------------
+            // Client-side telemetry.
+            //
+            // The host can see its own pipeline as far as the socket and no further. Which
+            // path this device actually ended up on — hardware decode into a canvas, or the
+            // <video> element because WebCodecs was missing; a SharedArrayBuffer audio ring or
+            // the postMessage fallback — is only knowable here, and every one of those is a
+            // silent degradation the host would otherwise never learn about. `SEVideo.getStats`
+            // is the read side; input.js ships the same numbers to the host once a second.
+            const VIDEO_PATH = { none: 0, webcodecsCanvas: 1, webcodecsVideo: 2, videoElement: 3 };
+            // 4 is appended rather than folded into 2: 2 has always meant "the page relays
+            // every packet", and a host reading it must go on meaning that. The
+            // MessagePort transport is a different, faster thing and gets its own code.
+            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3, workletPort: 4 };
+
+            let videoWorkerStats = null;
+            const fallbackStats = {
+                // The <video> path has no per-frame hooks except requestVideoFrameCallback,
+                // which reports the RTP timestamp on the browsers that implement it. Where it
+                // is missing this path reports frame counts only, and that gap is itself
+                // visible on the host as an absent percentile.
+                samples: [],
+                painted: 0,
+                rvfcSupported: false,
+            };
+            const FALLBACK_WINDOW = 256;
+
+            function pct(sorted, q) {
+                if (!sorted.length) return 0;
+                return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+            }
+
+            function fallbackPercentiles() {
+                if (!fallbackStats.samples.length) return null;
+                const a = fallbackStats.samples.slice().sort(function (x, y) { return x - y; });
+                return { p50: pct(a, 0.5), p90: pct(a, 0.9), p99: pct(a, 0.99), max: a[a.length - 1], n: a.length };
+            }
+
+            let rvfcHandle = 0;
+            function startFallbackFrameStats() {
+                if (typeof video.requestVideoFrameCallback !== 'function') return;
+                fallbackStats.rvfcSupported = true;
+                const step = function (_now, meta) {
+                    fallbackStats.painted++;
+                    if (video.videoWidth > 0) {
+                        try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+                    }
+                    if (hostClockOffsetMs !== null && meta && typeof meta.rtpTimestamp === 'number') {
+                        const hostMs = (meta.rtpTimestamp >>> 0) * 1000 / 90000;
+                        const paintMs = TIME_ORIGIN_MS +
+                            (typeof meta.expectedDisplayTime === 'number' ? meta.expectedDisplayTime : performance.now());
+                        const lag = paintMs - (hostMs - hostClockOffsetMs);
+                        // The RTP timestamp is 32 bits and wraps every ~13 h; a sample that
+                        // lands on the far side of a wrap is nonsense, so drop the impossible
+                        // ones rather than poison the window.
+                        if (lag >= 0 && lag < 10000) {
+                            fallbackStats.samples.push(lag);
+                            if (fallbackStats.samples.length > FALLBACK_WINDOW) fallbackStats.samples.shift();
+                        }
+                    }
+                    rvfcHandle = video.requestVideoFrameCallback(step);
+                };
+                rvfcHandle = video.requestVideoFrameCallback(step);
+            }
+
+            function stopFallbackFrameStats() {
+                if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
+                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) { noteSuppressed(); }
+                }
+                rvfcHandle = 0;
+                fallbackStats.samples.length = 0;
+                fallbackStats.painted = 0;
+            }
+
+            function activeVideoPath() {
+                if (usingFallback || !worker) return video.srcObject ? VIDEO_PATH.videoElement : VIDEO_PATH.none;
+                const w = videoWorkerStats;
+                if (w && w.renderTier === 2) return VIDEO_PATH.webcodecsVideo;
+                return VIDEO_PATH.webcodecsCanvas;
+            }
+
+            function activeAudioPath() {
+                if (!window.SEAudio) return AUDIO_PATH.none;
+                let info = null;
+                try { info = SEAudio.getSyncInfo(); } catch (_) { return AUDIO_PATH.none; }
+                if (!info || !info.path) return AUDIO_PATH.none;
+                if (info.path !== 'webcodecs') return AUDIO_PATH.opusTrack;
+                if (info.transport === 'shared') return AUDIO_PATH.workletSab;
+                if (info.transport === 'port') return AUDIO_PATH.workletPort;
+                return AUDIO_PATH.workletPost;
+            }
+
+            // One definition, so the flag the host is told cannot disagree with the branch the
+            // page took: the other one omitted mozFullScreenElement.
+            function isFullscreen() {
+                return !!currentFullscreenEl();
+            }
+
+            // Tier codes, mirrored in docs/TELEMETRY.md and in transform-worker.js.
+            const TRANSPORT_TIER = { none: 0, scriptTransform: 1, encodedStreams: 2 };
+            const RENDER_TIER = { none: 0, canvas2d: 1, trackGenerator: 2, videoElement: 3 };
+
+            function renderTierNow() {
+                if (usingFallback || !worker) return video.srcObject ? RENDER_TIER.videoElement : RENDER_TIER.none;
+                const w = videoWorkerStats;
+                return w ? (w.renderTier || RENDER_TIER.canvas2d) : RENDER_TIER.canvas2d;
+            }
+
+            let audioFastRetired = false;
+            window.SEVideo = {
+                noteSuppressed,
+                // The client claimed the WebCodecs audio path and the decoder or the worklet
+                // then gave up. Where the host honoured `wantsFallbackTrack` — every host in
+                // this repo does — audio.js has already attached the spare Opus track and this
+                // is never reached: the step-down is seamless and costs no renegotiation.
+                //
+                // This is the older-host case, where the answer carried no audio track at all.
+                // It used to rebuild the whole peer connection to ask for one, mid-session,
+                // behind a picture the user was watching. It no longer does: the claim is
+                // dropped so the *next* join gets a track, the loss is reported as `degraded`
+                // bit 6 and `audioPath` 0, and the picture is not touched. Nothing on this page
+                // renegotiates on its own account once the stage is up.
+                onAudioFastLost() {
+                    if (audioFastRetired || !audioFast) return;
+                    audioFastRetired = true;
+                    audioFast = false;
+                    // No DataChannel on the track path, so no redundancy to advertise either,
+                    // and no spare track to ask for: the next answer's audio track is the one
+                    // that gets fed. `verified` survives — the decoder really was probed, and
+                    // what it says about this device is what the host should log.
+                    audioCaps = {
+                        webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false,
+                        verified: !!audioCaps.verified, wantsFallbackTrack: false,
+                    };
+                    degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    console.warn('[audio] fast path lost and this host sent no spare track; ' +
+                        'audio stays off for this session — a rejoin gets a standard track');
+                },
+                getStats() {
+                    const w = videoWorkerStats;
+                    const fb = fallbackPercentiles();
+                    const audio = (window.SEAudio && SEAudio.getSyncInfo()) || {};
+                    const workerSuppressed = (w && w.suppressed) || 0;
+                    return {
+                        videoPath: activeVideoPath(),
+                        audioPath: activeAudioPath(),
+                        sab: typeof SharedArrayBuffer === 'function',
+                        crossOriginIsolated: !!self.crossOriginIsolated,
+                        wakeLock: wakeLockHeld(),
+                        pointerLock: !!document.pointerLockElement,
+                        pointerLockUnadjusted: pointerLockUnadjusted,
+                        keyboardLock: !!(navigator.keyboard && navigator.keyboard.lock),
+                        fullscreen: isFullscreen(),
+                        setSinkId: typeof HTMLMediaElement !== 'undefined' &&
+                            typeof HTMLMediaElement.prototype.setSinkId === 'function',
+                        decoderHardware: !!(w && w.decoderHardware),
+                        clockValid: hostClockOffsetMs !== null,
+                        rttMs: (window.SEClock && SEClock.rttMs) || 0,
+                        arrivalToPaint: w ? w.arrivalToPaint : null,
+                        decode: w ? w.decode : null,
+                        hostToPaint: w ? w.hostToPaint : fb,
+                        framesPainted: w ? w.framesRendered : fallbackStats.painted,
+                        framesDropped: w ? w.framesDropped : 0,
+                        decodeErrors: w ? w.decodeErrors : 0,
+                        keyRequests: w ? w.keyRequests : 0,
+                        audioUnderruns: audio.underruns || 0,
+                        audioOverruns: audio.overruns || 0,
+                        rvfcSupported: fallbackStats.rvfcSupported,
+                        // Which mechanism is live on each axis, so a device on a slow path
+                        // is distinguishable from a device on the fast one.
+                        transportTier: usingFallback ? TRANSPORT_TIER.none : ((w && w.transportTier) || TRANSPORT_TIER.none),
+                        renderTier: renderTierNow(),
+                        keyTier: (w && w.keyTier) || 0,
+                        sinkTier: (window.SEAudio && SEAudio.sinkTier && SEAudio.sinkTier()) || 0,
+                        suppressed: suppressedErrors + workerSuppressed +
+                            ((window.SEAudio && SEAudio.suppressedCount && SEAudio.suppressedCount()) || 0),
+                        degraded: degradeFlags | ((window.SEAudio && SEAudio.degradeFlags && SEAudio.degradeFlags(DEG)) || 0),
+                        audioTargetMs: audio.targetMs || 0,
+                        audioConcealed: audio.concealed || 0,
+                        audioOutputLatencyMs: audio.outputLatencyMs || 0,
+                        audioRedundantUsed: audio.redundantUsed || 0,
+                        audioRedundantDiscarded: audio.redundantDiscarded || 0,
+                    };
+                },
+            };
+
+            let videoStatsPoll = null;
+            function startVideoStatsPoll() {
+                if (videoStatsPoll) clearInterval(videoStatsPoll);
+                const tick = function () { if (worker) worker.postMessage({ type: 'videostats' }); };
+                // A plain setInterval's first tick is a full second out, and until it lands
+                // videoWorkerStats is null — which is also the whole first second after every
+                // reconfigure, because teardownSession clears it.
+                tick();
+                videoStatsPoll = setInterval(tick, 1000);
+            }
+
+            if (window.SEClock) {
+                SEClock.subscribe(function (offsetMs) {
+                    // Every other consumer screens this with isFinite; this one assigned it
+                    // straight through and then reported clockValid for a NaN offset.
+                    if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) { noteSuppressed(); return; }
+                    hostClockOffsetMs = offsetMs;
+                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) { noteSuppressed(); }
+                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) { noteSuppressed(); }
+                });
+            }
+
+            // The out-of-band keyframe request is a tier only if the host parses the opcode.
+            // It says so in the PONG capability bits, which land about a second into the
+            // session, so the worker starts at "no way to ask" — which keeps its own give-up
+            // signal and the page's stall demotion armed — and is told if that changes.
+            function relayOutOfBandKey() {
+                if (!worker) return;
+                let available = false;
+                try {
+                    available = !!(window.RemoteInput && RemoteInput.hostCapability &&
+                        RemoteInput.hostCapability('KEYFRAME_REQUEST'));
+                } catch (_) { noteSuppressed(); }
+                try { worker.postMessage({ type: 'outofbandkey', available: available }); } catch (_) { noteSuppressed(); }
+            }
+            if (window.RemoteInput && RemoteInput.onHostCapabilities) {
+                RemoteInput.onHostCapabilities(relayOutOfBandKey);
+            }
+
             let __workerBlobUrl = null;
             async function makeTransformWorker() {
                 try {
@@ -654,12 +2161,37 @@
                 }
             }
 
-            async function start(preferWebCodecs) {
-                teardownSession();
+            const TRANSFORM_START_TIMEOUT_MS = 2500;
+            const FRAME_WATCHDOG_MS = 5000;
+            const WHEP_TIMEOUT_MS = 10000;
+
+            // `keepJoin` says this is the same session offering again rather than a new one.
+            // `teardownSession` has already decided whether `currentJoinId` survives, so the
+            // body below can present it unconditionally: it is the empty string on a fresh join.
+            async function start(preferWebCodecs, keepJoin) {
+                teardownSession(keepJoin);
+                // After teardownSession, so this call owns the newest generation.
+                const gen = ++startGen;
+                const stale = () => gen !== startGen;
+                let localTrickle = null;
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
-                    const iceServers = await getIceServers();
+                    const useScriptTransform = useScriptTransformNow();
+                    // Primed at load, so this is normally already resolved. Read before the ICE
+                    // config so both are in hand before the peer connection exists.
+                    const netConfig = await getNetConfig();
+                    if (stale()) return;
+                    const canTrickle = !trickleOff && netConfig.trickleIce === true;
+                    const iceConfig = await getIceConfig();
+                    if (stale()) return;
+                    const iceServers = iceConfig.iceServers;
+                    // Computed once and carried into the gathering wait: without it the wait took
+                    // the LAN branch on every session and cut gathering ~200 ms in, before any
+                    // TURN allocation could return. It comes from the host's locality rather than
+                    // from the server list, because a LAN host hands out TURN as a backup.
+                    const needRelay = relayNeeded(iceConfig);
+                    if (DEBUG) console.log('[ice] locality=' + iceConfig.locality + ' needRelay=' + needRelay);
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
@@ -667,51 +2199,149 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
-                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
+                    try {
+                        if (window.RemoteInput) {
+                            RemoteInput.setup(pc);
+                            // `teardown()` clears input.js's own flag, so a session built while
+                            // a dialog is still up would forward input with `modalSuspend` set
+                            // and the page's two notions of suspension would disagree.
+                            if (modalSuspend && RemoteInput.setSuspended) RemoteInput.setSuspended(true);
+                        }
+                    } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
                         if (audioFast) {
-                            SEAudio.prepare();
                             pc.ondatachannel = (ev) => {
                                 if (ev.channel && ev.channel.label === 'audio') {
                                     SEAudio.attachDataChannel(ev.channel);
                                 }
                             };
-                        } else {
-                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+                        }
+                        // The recvonly audio section goes in on both paths now. Off the fast
+                        // path it carries the track the host feeds. On the fast path it is the
+                        // spare `wantsFallbackTrack` asks for — and an SDP answer may not add an
+                        // m-line the offer did not contain (RFC 3264 §6), so without a section
+                        // here the host's spare track has nowhere to land and is simply dropped
+                        // from the answer. WHEP has no renegotiation verb, so this is the only
+                        // moment it can exist at all: without it a decoder that says "supported"
+                        // and then fails on real packets is silence for the rest of the session.
+                        if (!audioFast || audioCaps.wantsFallbackTrack) {
+                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
+                    // Both of these — and the host's PlayoutDelayExtension(0, 0) — only affect
+                    // a client that ends up on the <video> element. An encoded transform takes
+                    // the frame from RtpVideoStreamReceiver2::OnAssembledFrame *instead of*
+                    // entering the reference finder and the frame buffer, and the frame buffer
+                    // is what these are inputs to. Set them anyway: they cost nothing and they
+                    // are correct for the fallback, which is the one path that has a jitter
+                    // buffer at all. See findings and docs/OPTIMIZATIONS.md — the same branch
+                    // is why every receive-side timing field in getStats() reads zero here.
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
-                        worker = await makeTransformWorker();
+                        const w = await makeTransformWorker();
+                        if (stale()) { try { w.terminate(); } catch (_) { noteSuppressed(); } return; }
+                        worker = w;
+                        // A worker whose script fails to load or parse is constructed
+                        // successfully and then simply never posts anything, so without this
+                        // the only net is a timeout — 2.5 s where there is a legacy transform
+                        // to fall back to, and five seconds of black screen on Safari, where
+                        // there is not.
+                        worker.onerror = (ev) => {
+                            noteSuppressed();
+                            fallbackToVideo('transform worker failed: ' + ((ev && ev.message) || 'unknown'));
+                        };
+                        worker.onmessageerror = noteSuppressed;
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
                                 onStreamLive();
                             } else if (m.data.type === 'decodeerror') {
                                 console.warn('[webcodecs] decode error:', m.data.message);
+                            } else if (m.data.type === 'painterror') {
+                                noteSuppressed();
+                                console.warn('[webcodecs] paint error:', m.data.message);
                             } else if (m.data.type === 'configerror') {
                                 console.error('[webcodecs] configure() failed for codec', m.data.codec, ':', m.data.message);
                                 fallbackToVideo('VideoDecoder.configure failed: ' + m.data.message);
+                            } else if (m.data.type === 'decoderdead') {
+                                fallbackToVideo('decoder failed ' + m.data.resets + ' times in a row');
                             } else if (m.data.type === 'backlog') {
-                                console.warn('[webcodecs] decoder backlog (' + m.data.size + '); dropping to freshest frame');
+                                console.warn('[webcodecs] ' + m.data.inFlight + ' decodes still outstanding; skipping to the next keyframe');
+                            } else if (m.data.type === 'requestkey') {
+                                // The legacy transform cannot ask for an IDR itself; relay it
+                                // over the reliable input channel instead of freezing.
+                                let sent = false;
+                                try { sent = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                                if (!sent) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                            } else if (m.data.type === 'nokeyframe') {
+                                // Only now is a demotion the right answer: we asked by every
+                                // means available and the host still sent no keyframe.
+                                console.warn('[webcodecs] no keyframe after ' + Math.round(m.data.waitedMs) + ' ms (keyTier=' + m.data.keyTier + ')');
+                                if (!m.data.keyTier) fallbackToVideo('no keyframe and no way to ask for one');
                             } else if (m.data.type === 'transformstart') {
-                                console.log('[webcodecs] onrtctransform FIRED — readable=' + m.data.hasReadable + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                                transformStarted = true;
+                                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
+                                console.log('[webcodecs] transform started — transport=' + m.data.transport + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                            } else if (m.data.type === 'trackgen') {
+                                attachTrackGenerator(m.data.track);
                             } else if (m.data.type === 'firstframe') {
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                            } else if (m.data.type === 'size') {
+                                try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.width, m.data.height); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
                             } else if (m.data.type === 'avsync') {
-                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
+                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) { noteSuppressed(); }
+                            } else if (m.data.type === 'videostats') {
+                                videoWorkerStats = m.data.stats;
+                                // Latched here rather than in SEVideo.getStats(), which is the
+                                // documented console read-side: typing it must not change what
+                                // the host is told.
+                                // The poll fires its first tick immediately, before the
+                                // transform is installed, and the worker answers from its
+                                // initial state: keyTier 0 because no transform has fired and
+                                // no PONG has landed, decoderHardware false because
+                                // doConfigure has not run. Latching either from that reply set
+                                // both bits on every session for the rest of its life. Both
+                                // conditions are re-evaluated instead, and only once the thing
+                                // that determines them has actually happened.
+                                if (m.data.stats) {
+                                    const w = m.data.stats;
+                                    if (w.configured) {
+                                        if (w.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
+                                        else undegrade(DEG.DECODER_HW_UNAVAILABLE);
+                                    }
+                                    if (w.transportTier) {
+                                        if (w.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                        else undegrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                    }
+                                }
+                                if (m.data.stats && m.data.stats.displayWidth) {
+                                    try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.stats.displayWidth, m.data.stats.displayHeight); } catch (_) { noteSuppressed(); }
+                                }
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
                         };
-                        const off = freshCanvas().transferControlToOffscreen();
-                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        relayOutOfBandKey();
+                        if (PRESENT_PREF === 'track') {
+                            worker.postMessage({ type: 'trackgen' });
+                        } else {
+                            const off = freshCanvas().transferControlToOffscreen();
+                            worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        }
+                        if (hostClockOffsetMs !== null) worker.postMessage({ type: 'clockoffset', offsetMs: hostClockOffsetMs });
+                        startVideoStatsPoll();
                         if (useScriptTransform) {
-                            videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            try {
+                                videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            } catch (err) {
+                                retryWithLegacyTransform('RTCRtpScriptTransform threw: ' + err.message);
+                                return;
+                            }
+                            transformStarted = false;
                         } else {
                             let readable;
                             try {
@@ -722,21 +2352,78 @@
                             }
                             worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
+                        // Both of these are inert on this path and deliberately kept: the
+                        // transform runs in place of libwebrtc's reference finder, so the
+                        // frame buffer they configure is never reached. They are set anyway
+                        // so a future engine that moves the transform downstream does not
+                        // silently reintroduce a jitter buffer.
                         try {
                             if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
-                        } catch (_) {}
-                        showCanvas();
+                        } catch (_) { noteSuppressed(); }
+                        if (PRESENT_PREF !== 'track') showCanvas();
+                    }
+
+                    // `onrtctransform` cannot fire until ICE has connected and the first
+                    // encoded frame has arrived, so 2500 ms measured from installing the
+                    // transform is well inside the setup budget this same function allots to
+                    // ICE alone — a slow or cross-network join was demoted off
+                    // RTCRtpScriptTransform for being slow, permanently losing
+                    // sendKeyFrameRequest(). Measure from the first sign that packets should
+                    // be flowing instead.
+                    let transformWatchdogArmed = false;
+                    // Both watchdogs are armed from the same event, and it is this one: the
+                    // moment packets should be flowing. They used to start from different
+                    // origins — this one at ICE-connected, the 5 s demotion at `ontrack`, which
+                    // is during setRemoteDescription and therefore *earlier* — so any join whose
+                    // ICE took more than about 2.5 s after the answer had the 5 s timer fire
+                    // first and skip the ladder entirely. A cross-network or relayed join
+                    // reaching 3 s of ICE is ordinary, and the cost was landing on <video> for
+                    // the whole session instead of stepping one rung to createEncodedStreams.
+                    function armTransformWatchdog() {
+                        armFrameWatchdog();
+                        if (transformWatchdogArmed || transformStarted) return;
+                        if (!(webcodecs && useScriptTransform && hasLegacyEncodedStreams)) return;
+                        transformWatchdogArmed = true;
+                        transformWatchdog = setTimeout(() => {
+                            transformWatchdog = null;
+                            if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
+                        }, TRANSFORM_START_TIMEOUT_MS);
+                    }
+
+                    // The bottom of the ladder, but it steps rather than jumps: a script
+                    // transform that never fired still has a rung below it that keeps WebCodecs
+                    // and the ~90 ms the <video> element costs. retryWithLegacyTransform falls
+                    // through to fallbackToVideo where there is no legacy transform, so this
+                    // stays bounded either way.
+                    function armFrameWatchdog() {
+                        // Only the WebCodecs path has anything to demote to; the <video> path
+                        // is already the floor and its liveness is the reconfig poll's job.
+                        if (watchdog || !webcodecs) return;
+                        watchdog = setTimeout(() => {
+                            watchdog = null;
+                            if (webcodecs && useScriptTransform && hasLegacyEncodedStreams && !transformStarted) {
+                                retryWithLegacyTransform('no WebCodecs frame within 5s');
+                            } else {
+                                fallbackToVideo('no WebCodecs frame within 5s');
+                            }
+                        }, FRAME_WATCHDOG_MS);
                     }
 
                     pc.ontrack = (e) => {
                         if (e.track.kind === 'audio') {
-                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) {}
+                            // Remembered, not attached: on the fast path this track is the
+                            // spare `wantsFallbackTrack` asked for, and playing it now would
+                            // report the slow path while the worklet is still running.
+                            try { if (window.SEAudio) SEAudio.noteFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
                             return;
                         }
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
-                            showCanvas();
+                            // ontrack lands after a network round trip, well after the worker
+                            // answered `trackgen`, so an unguarded showCanvas() here hid the
+                            // <video> the generator had just been attached to.
+                            if (PRESENT_PREF !== 'track') showCanvas();
                             if (DEBUG) statsPoll = setInterval(() => {
                                 if (worker) worker.postMessage({ type: 'stats' });
                                 if (pc) pc.getStats().then((rep) => {
@@ -761,7 +2448,6 @@
                                     if (!foundInbound) console.log('[webcodecs] NO inbound-rtp stat yet; candidate-pair=' + pair);
                                 }).catch((err) => console.log('[webcodecs] getStats failed', err));
                             }, 1000);
-                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 5s'), 5000);
                             lastRendered = -1; lastBytes = -1; renderStalls = 0;
                             if (liveWatch) clearInterval(liveWatch);
                             liveWatch = setInterval(() => {
@@ -770,11 +2456,15 @@
                             }, 2000);
                         } else {
                             video.srcObject = e.streams[0];
+                            // These are real on this path, unlike on the WebCodecs one: the
+                            // <video> element goes through libwebrtc's frame buffer, so the
+                            // target it is given is the target it keeps.
                             try {
                                 if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
-                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
-                            } catch (_) {}
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) { noteSuppressed(); }
+                            } catch (_) { noteSuppressed(); }
                             showVideo();
+                            startFallbackFrameStats();
                             tryPlay();
                         }
                     };
@@ -783,67 +2473,190 @@
                     pc.oniceconnectionstatechange = () => {
                         if (pc !== localPc) return;
                         const s = pc.iceConnectionState;
-                        if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
-                            onStreamLive();
+                        if (s === 'connected' || s === 'completed') {
+                            // A pair is nominated, so a trickle failure can no longer produce a
+                            // rejoin (`trickleFailed` returns early on a connected session, and
+                            // `iceEverConnected` keeps that true for the rest of this one). The
+                            // hold exists only to keep a rejoin in front of the join form, so
+                            // from here it protects nothing and the picture should not wait on
+                            // the last PATCH being acknowledged.
+                            iceEverConnected = true;
+                            iceSettled();
+                            armTransformWatchdog();
+                            if (usingFallback || !canWebCodecs) onStreamLive();
                         } else if (s === 'failed') {
-                            teardownSession();
-                            usingFallback = false;
-                            showError('Connection failed.');
+                            linkLost('Connection failed.');
                         }
                     };
                     pc.onconnectionstatechange = () => {
-                        if (pc !== localPc || reconfiguring) return;
-                        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                            teardownSession();
-                            usingFallback = false;
-                            showError('Disconnected, reconnect to continue.');
-                        }
+                        if (pc !== localPc) return;
+                        const s = pc.connectionState;
+                        if (s === 'connected') armTransformWatchdog();
+                        if (reconfiguring) return;
+                        if (s === 'connected') markAlive();
+                        else if (s === 'disconnected') enterDegraded();
+                        else if (s === 'failed') linkLost('Disconnected, reconnect to continue.');
                     };
 
                     const offer = await pc.createOffer();
+                    if (stale()) return;
                     await pc.setLocalDescription(offer);
-                    await waitForIceGathering(pc, hasTurnServer(iceServers) ? 6000 : 3000);
+                    if (stale()) return;
+                    if (canTrickle) {
+                        // No wait at all: the offer goes out with whatever `setLocalDescription`
+                        // had — usually nothing — and every candidate follows over PATCH. This is
+                        // the whole win on a relayed join, where the wait was a TURN allocation
+                        // the POST had no reason to be behind.
+                        holdStageForIce();
+                        localTrickle = startTrickle(pc, function (reason) {
+                            if (stale()) { noteSuppressed(); return; }
+                            trickleFailed(reason, preferWebCodecs);
+                        }, function () {
+                            // A settle from a sender this call no longer owns belongs to the
+                            // generation that replaced it, which armed its own hold.
+                            if (stale()) return;
+                            iceSettled();
+                        });
+                        trickleSender = localTrickle;
+                    } else {
+                        degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                        await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
+                        if (stale()) return;
+                    }
+                    const offerSdp = pc.localDescription.sdp;
 
-                    let storedToken = '';
-                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) {}
-                    const resp = await fetch('/whep', {
+                    const storedToken = readDeviceToken();
+                    const whepOpts = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             sessionId: joinData.sessionId,
                             otp: joinData.otp,
                             deviceToken: storedToken,
+                            // Empty unless this is the same tab renegotiating. The host honours
+                            // it only while the session is still live and still belongs to this
+                            // device token, so a stale one costs a fresh join and nothing else.
+                            joinId: currentJoinId,
                             deviceName: joinData.deviceName,
                             os: joinData.os,
                             refreshRate: joinData.refreshRate,
                             width: joinData.width,
                             height: joinData.height,
                             dpr: getDpr(),
-                            sdp: pc.localDescription.sdp,
+                            sdp: offerSdp,
                             audioCapabilities: audioCaps,
                         }),
-                    });
+                    };
+                    // A host that accepts the connection and never answers — a wedged
+                    // display-correlation lock, a suspended VM, a black-holed route — parked
+                    // this await forever, and on the reconfigure path that is a frozen picture
+                    // with every recovery mechanism switched off.
+                    let whepAbort = null;
+                    let whepTimer = 0;
+                    if (typeof AbortController === 'function') {
+                        whepAbort = new AbortController();
+                        whepOpts.signal = whepAbort.signal;
+                        whepTimer = setTimeout(function () {
+                            try { whepAbort.abort(); } catch (_) { noteSuppressed(); }
+                        }, WHEP_TIMEOUT_MS);
+                    }
+                    let resp;
+                    try {
+                        resp = await fetch('/whep', whepOpts);
+                    } catch (err) {
+                        if (whepAbort && whepAbort.signal.aborted) throw new Error('The host did not answer in time.');
+                        throw err;
+                    } finally {
+                        if (whepTimer) clearTimeout(whepTimer);
+                    }
+                    if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    // Read before anything can return: this join was accepted, and the token it
+                    // issued is what a rejoin — including the one two lines below — presents
+                    // instead of the OTP.
                     const issuedToken = resp.headers.get('X-Device-Token');
-                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) {} }
+                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
+                    let trickleResource = null;
+                    try { trickleResource = resp.headers.get('Location'); } catch (_) { noteSuppressed(); }
+                    // The session's name. `X-Join-Id` is the direct form; the WHEP resource in
+                    // `Location` is the same id, so either header answers and a proxy has to
+                    // strip both to leave this tab nameless. The host also sets an `se_join`
+                    // cookie, which covers a page cached from before the id existed — but a
+                    // cookie is per-origin and two tabs share it, so this page never reads it
+                    // and always sends the explicit parameter.
+                    let issuedJoin = '';
+                    try { issuedJoin = resp.headers.get('X-Join-Id') || ''; } catch (_) { noteSuppressed(); }
+                    if (!issuedJoin && trickleResource) {
+                        const tail = /\/whep\/([0-9a-f]{32})$/.exec(trickleResource);
+                        if (tail) issuedJoin = tail[1];
+                    }
+                    if (issuedJoin) {
+                        setJoinId(issuedJoin);
+                        undegrade(DEG.JOIN_ID_MISSING);
+                    } else {
+                        setJoinId('');
+                        degrade(DEG.JOIN_ID_MISSING);
+                        console.warn('[join] the host named no session; /reconfig and /leave will reach nothing');
+                    }
+                    if (localTrickle) {
+                        if (trickleResource) {
+                            localTrickle.open(trickleResource, offerSdp);
+                            // Only now can the sender do anything, so only now is there
+                            // something for a deadline to be a deadline on.
+                            armIceSettleDeadline();
+                        } else {
+                            // The host said it takes trickled candidates and then handed back no
+                            // resource — a proxy that strips the header, or the cloud relay,
+                            // which tunnels /whep but has no URL space of its own. The offer that
+                            // went out carries no candidates, so there is nothing to salvage.
+                            localTrickle.stop();
+                            trickleFailed('the answer named no resource', preferWebCodecs);
+                            return;
+                        }
+                    }
                     const answerSdp = await resp.text();
+                    if (stale()) return;
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                    if (stale()) return;
+
+                    try {
+                        if (window.SEAudio) {
+                            SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken, currentJoinId);
+                            Promise.resolve(SEAudio._enumPromise).then(() => SEAudio.postOutputs()).catch(() => {});
+                        }
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs && worker) {
                         const plid = negotiatedProfileLevelId(answerSdp);
-                        if (plid) worker.postMessage({ type: 'codechint', profileLevelId: plid });
+                        if (!plid) degrade(DEG.NO_H264_FMTP);
+                        // The coded size goes with it: isConfigSupported can only answer
+                        // honestly about a configuration it has been given in full, and the
+                        // host was asked for exactly this size.
+                        const dpr = getDpr();
+                        worker.postMessage({
+                            type: 'codechint',
+                            profileLevelId: plid || '',
+                            width: Math.round(joinData.width * dpr),
+                            height: Math.round(joinData.height * dpr),
+                        });
                     }
                 } catch (err) {
                     console.error(err);
-                    const isAuthError = /Invalid session ID or OTP/.test(err.message);
+                    // Stopping is idempotent, and this one belongs to the connection that just
+                    // failed whether or not a newer start() has taken over.
+                    if (localTrickle) localTrickle.stop();
+                    // A newer start() already owns pc and worker; this one's failure is about a
+                    // connection nobody is using any more.
+                    if (stale()) { noteSuppressed(); return; }
+                    const isAuthError = /Invalid session ID or OTP/.test(err && err.message);
                     if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
-                        fallbackToVideo('setup error: ' + err.message);
+                        fallbackToVideo('setup error: ' + errorText(err));
                     } else if (reconfiguring && isLive) {
                         reconfiguring = false;
                         startReconfigPoll();
                     } else {
-                        showError(err.message);
+                        showError(errorText(err));
                     }
                 }
             }
@@ -851,9 +2664,8 @@
             async function httpsUrl() {
                 let httpsPort = 8443;
                 try {
-                    const r = await fetch('/net-config');
-                    if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
-                } catch (_) {}
+                    httpsPort = (await getNetConfig()).httpsPort || httpsPort;
+                } catch (_) { noteSuppressed(); }
                 const u = new URL(location.href);
                 u.protocol = 'https:';
                 u.port = httpsPort;
@@ -868,18 +2680,26 @@
             async function offerHttpsUpgrade() {
                 loadingEl.classList.remove('show');
                 const href = await httpsUrl();
-                document.getElementById('goHttps').onclick = () => { location.href = href; };
-                document.getElementById('dismiss').onclick = () => {
-                    modal.classList.remove('show');
-                    loadingEl.classList.add('show');
-                    start(false);
-                };
-                modal.classList.add('show');
+                withModal((close) => {
+                    document.getElementById('goHttps').onclick = () => { close(); location.href = href; };
+                    document.getElementById('dismiss').onclick = () => {
+                        modal.classList.remove('show');
+                        close();
+                        loadingEl.classList.add('show');
+                        start(false);
+                    };
+                    modal.classList.add('show');
+                });
             }
 
+            // `true`, so a reconnect after a lost link presents the join this tab still holds
+            // rather than asking for a second display beside the one the host is keeping for it.
+            // It is the empty string on a first join, on a reload (`releaseStaleJoin`) and after
+            // a kick, so those are new joins exactly as before — and an id naming a session this
+            // host does not have, or one belonging to another device, is a new join too.
             function beginStreaming() {
                 if (location.protocol === 'http:' && !canWebCodecs) offerHttpsUpgrade();
-                else start(true);
+                else start(true, true);
             }
 
             let httpsUpgradeOffered = false;
@@ -889,9 +2709,11 @@
                 if (typeof compatBlocked !== 'undefined' && compatBlocked) return;
                 httpsUpgradeOffered = true;
                 const href = await httpsUrl();
-                document.getElementById('goHttps').onclick = () => { location.href = href; };
-                document.getElementById('dismiss').onclick = () => { modal.classList.remove('show'); };
-                modal.classList.add('show');
+                withModal((close) => {
+                    document.getElementById('goHttps').onclick = () => { close(); location.href = href; };
+                    document.getElementById('dismiss').onclick = () => { modal.classList.remove('show'); close(); };
+                    modal.classList.add('show');
+                });
             }
 
             const VALID_RE = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/;
@@ -904,11 +2726,14 @@
 
             const FULLSCREEN_MODE_KEY = 'se.fullscreenMode';
             const DEVICE_TOKEN_KEY = 'se.deviceToken';
+            function readDeviceToken() {
+                try { return localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
+            }
             try {
                 if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
-            } catch (_) {}
+            } catch (_) { noteSuppressed(); }
             fullscreenModeInput.addEventListener('change', () => {
-                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) {}
+                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) { noteSuppressed(); }
             });
 
             document.getElementById('brand').addEventListener('click', () => {
@@ -951,23 +2776,53 @@
                     requestAnimationFrame(frame);
                 });
             }
-            function clampRefresh(r) { return r > 0 ? Math.round(r) : 0; }
+            function clampRefresh(r) { return r > 0 ? Math.round(r / 10) * 10 : 0; }
             function screenRefreshRate() {
                 const r = window.screen && window.screen.refreshRate;
                 return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
-            function relayRefreshRate(rate) {
-                if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
+            // The measured rate is folded into joinData *before* the offer goes out, so the
+            // host builds the display at the right rate the first time. It used to be
+            // measured after the stream went live and then applied by tearing the session
+            // down and rebuilding it — every 90, 120 or 144 Hz client renegotiated about a
+            // second after connecting, retaking the host's display-correlation lock on the
+            // way. If the rate is still unknown at submit time it stays unknown: a later
+            // refinement only updates joinData, so the next reconfigure that happens for
+            // some other reason (an orientation change, a host setting) carries it.
+            // Long enough for REFRESH_SAMPLES rAF callbacks at 60 Hz (~383 ms) with room to
+            // spare. It used to be 400 ms against a 60-sample measurement, i.e. ~1 s at 60 Hz —
+            // so resolveRefreshRate returned 0 on essentially every join and the true rate was
+            // applied only if some unrelated reconfigure happened later, which for most
+            // sessions is never. A 120 Hz client ran the host display at the default rate.
+            const REFRESH_DEADLINE_MS = 500;
+            const AUDIO_PREPARE_DEADLINE_MS = 2000;
+            async function resolveRefreshRate() {
+                const reported = screenRefreshRate();
+                if (reported) return reported;
+                degrade(DEG.REFRESH_RATE_MEASURED);
+                const measured = await Promise.race([
+                    refreshRatePromise,
+                    new Promise((r) => setTimeout(() => r(0), REFRESH_DEADLINE_MS)),
+                ]);
+                return clampRefresh(measured) || 0;
+            }
+            // The refinement is the safety net for a join-time measurement that was wrong, not
+            // the normal path: with REFRESH_SAMPLES at 24 the measurement lands inside the
+            // deadline and the first offer already carries the right rate. It is wrong when
+            // the page spent its first half-second in a background tab or behind a layout
+            // storm, where rAF is throttled and the measured rate is far too low.
+            //
+            // It used to answer that by rebuilding the session about a second after the picture
+            // came up — a renegotiation the user did not ask for, over a screen they had just
+            // started using, and one that retook the host's display-correlation lock on the way.
+            // It now only updates `joinData`, so the corrected rate rides the next reconfigure
+            // that happens for a reason of its own: a rotation, or a change made on the host.
+            function noteRefinedRefreshRate(rate) {
+                if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
                 if (Math.abs(rate - cur) < 5) return;
                 joinData.refreshRate = rate;
-                console.log('[refresh] refined to ' + rate + ' Hz; reconfiguring host display');
-                reconfigure();
-            }
-            async function refineRefreshRate() {
-                let rate = screenRefreshRate();
-                if (!rate) rate = clampRefresh(await refreshRatePromise);
-                relayRefreshRate(rate);
+                console.log('[refresh] refined to ' + rate + ' Hz from ' + cur + '; will apply at the next reconfigure');
             }
 
             function validate() {
@@ -993,13 +2848,13 @@
                 const fs = params.get('fs');
                 if (fs === '0' || fs === '1') {
                     fullscreenModeInput.checked = fs === '1';
-                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) {}
+                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) { noteSuppressed(); }
                 }
 
-                if (params.has('otp') || params.has('name')) {
+                const consumed = ['otp', 'name', 'fs'];
+                if (consumed.some((k) => params.has(k))) {
                     const clean = new URL(window.location.href);
-                    clean.searchParams.delete('otp');
-                    clean.searchParams.delete('name');
+                    consumed.forEach((k) => clean.searchParams.delete(k));
                     history.replaceState(null, '', clean.toString());
                 }
 
@@ -1041,7 +2896,17 @@
             sessionInput.addEventListener('input', validate);
             nameInput.addEventListener('input', validate);
 
-            const refreshRatePromise = getRefreshRate().catch(() => 0);
+            // performance.timeOrigin is Safari 15; input.js already computes it the long
+            // way for the clock offset and this is the other consumer. Without it every
+            // <video>-path lag sample was NaN, failed `lag >= 0`, and was discarded — so
+            // host-to-paint read 0 on precisely the old browsers that take that path.
+            const TIME_ORIGIN_MS = (typeof performance.timeOrigin === 'number' && isFinite(performance.timeOrigin))
+                ? performance.timeOrigin
+                : (Date.now() - performance.now());
+
+            const REFRESH_SAMPLES = 24;
+            const REFRESH_REFINE_SAMPLES = 60;
+            const refreshRatePromise = getRefreshRate(REFRESH_SAMPLES).catch(() => 0);
 
             const COMPAT_HIDE_KEY = 'se.compat.hideLimited';
 
@@ -1052,7 +2917,7 @@
                 try {
                     if (hidden) localStorage.setItem(COMPAT_HIDE_KEY, '1');
                     else localStorage.removeItem(COMPAT_HIDE_KEY);
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
             }
 
             function checkBrowserRequirements() {
@@ -1067,14 +2932,64 @@
                 if (typeof fetch !== 'function') {
                     unsupported.push({
                         name: 'Fetch API',
-                        description: 'Required to negotiate the connection with the host.',
+                        description: 'Required to negotiate the connection and to pick up display changes made on the host.',
                         severity: 'blocking',
                     });
                 }
+                // `httpsFixable` is read by the compat gate below and only ever on an http
+                // page, where it means "do not list this row; offer the switch to HTTPS
+                // instead". The switch itself is offered on every system, deliberately: a
+                // secure context is the precondition for both fast paths whether or not this
+                // particular engine would then have them, and an offer that is right for almost
+                // every device beats a per-engine guess.
+                //
+                // The one exception is `http://localhost`, which *is* a secure context — so the
+                // fast paths are missing there for some other reason, and suppressing the rows
+                // would hide the only explanation the user gets. That is the same-device join.
+                const httpsFixable = location.protocol === 'http:' &&
+                    !(typeof window.isSecureContext === 'boolean' && window.isSecureContext);
                 if (!canWebCodecs) {
                     unsupported.push({
-                        name: 'WebCodecs low-latency playback',
-                        description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode.',
+                        name: 'WebCodecs video',
+                        description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
+                        severity: 'optional',
+                        httpsFixable: httpsFixable,
+                    });
+                }
+                // One row, gated on the pair, and the original wording: this modal's rendered
+                // content is not this branch's to change. Splitting it into a row per capability
+                // showed two rows where one used to appear on Safari 16.4-17 and Firefox 130+,
+                // and added a third for cross-origin isolation that is close to unreachable —
+                // WebCodecs needs a secure context, and on one the host's own COOP/COEP headers
+                // make `crossOriginIsolated` true.
+                if (!audioFast) {
+                    unsupported.push({
+                        name: 'WebCodecs audio and AudioWorklet',
+                        description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
+                        severity: 'optional',
+                        httpsFixable: httpsFixable,
+                    });
+                }
+                const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
+                    typeof RTCPeerConnection.prototype.createDataChannel === 'function';
+                if (!hasDataChannel) {
+                    unsupported.push({
+                        name: 'WebRTC data channels',
+                        description: 'Carry remote control. Without them this device is view-only, and keyboard, mouse and clipboard stay on the host.',
+                        severity: 'optional',
+                    });
+                } else if (!window.PointerEvent) {
+                    unsupported.push({
+                        name: 'Pointer Events',
+                        description: 'Send your touches and mouse moves to the host. Without them the screen is view-only for touch; a physical keyboard and the clipboard still work.',
+                        severity: 'optional',
+                    });
+                }
+                if (!(stage.requestFullscreen || stage.webkitRequestFullscreen ||
+                    stage.mozRequestFullScreen || stage.msRequestFullscreen)) {
+                    unsupported.push({
+                        name: 'Fullscreen API',
+                        description: 'Without it, fullscreen mode only fills the browser window, so the address bar and tabs stay on screen.',
                         severity: 'optional',
                     });
                 }
@@ -1130,18 +3045,25 @@
                 if (blocking.length > 0) {
                     compatBlocked = true;
                     connectBtn.disabled = true;
+                    // No dismiss button on the blocking form, so this one is never closed and
+                    // never releases: there is no session for it to be holding anything back
+                    // from either.
+                    beginModal();
                     renderCompatModal(blocking, true);
                     return;
                 }
 
-                const optional = report.filter((a) => a.severity === 'optional');
-                const deferToHttps = location.protocol === 'http:' && !canWebCodecs;
-                if (optional.length > 0 && !deferToHttps && !compatPrefHidden()) {
-                    renderCompatModal(optional, false);
-                    document.getElementById('compatContinue').onclick = () => {
-                        setCompatPrefHidden(document.getElementById('compatDontShow').checked);
-                        compatModal.classList.remove('show');
-                    };
+                const onHttp = location.protocol === 'http:';
+                const optional = report.filter((a) => a.severity === 'optional' && !(onHttp && a.httpsFixable));
+                if (optional.length > 0 && !compatPrefHidden()) {
+                    withModal((close) => {
+                        renderCompatModal(optional, false);
+                        document.getElementById('compatContinue').onclick = () => {
+                            setCompatPrefHidden(document.getElementById('compatDontShow').checked);
+                            compatModal.classList.remove('show');
+                            close();
+                        };
+                    });
                 }
             })();
 
@@ -1150,15 +3072,76 @@
                     void offerHttpsOnLoad();
                     return;
                 }
-                const m = document.getElementById('sameDeviceModal');
-                const dismiss = document.getElementById('sameDeviceDismiss');
-                if (dismiss) dismiss.onclick = () => { m.classList.remove('show'); void offerHttpsOnLoad(); };
-                m.classList.add('show');
+                withModal((close) => {
+                    const m = document.getElementById('sameDeviceModal');
+                    const dismiss = document.getElementById('sameDeviceDismiss');
+                    if (dismiss) dismiss.onclick = () => { m.classList.remove('show'); close(); void offerHttpsOnLoad(); };
+                    m.classList.add('show');
+                });
             })();
+
+            function showPermModal(onContinue, onSkip) {
+                withModal((close) => {
+                    const m = document.getElementById('permModal');
+                    const cont = document.getElementById('permContinue');
+                    const skip = document.getElementById('permSkip');
+                    const done = (fn) => {
+                        m.style.display = 'none';
+                        cont.onclick = null;
+                        skip.onclick = null;
+                        close();
+                        try { fn && fn(); } catch (_) { noteSuppressed(); }
+                    };
+                    cont.onclick = () => done(onContinue);
+                    skip.onclick = () => done(onSkip);
+                    m.style.display = 'flex';
+                });
+            }
+
+            // The card is raised in exactly one place — before the join, from the submit
+            // handler, with the page still on the join form and nothing fullscreen. There is
+            // therefore no "the modal became invisible inside a fullscreen subtree" case to
+            // handle and no deferral to remember: the user answers it, and whichever way they
+            // answer, the session that follows is never interrupted by it again. A decline is
+            // reported for the rest of the session as `degraded` bit 9 and costs nothing but
+            // the labels beside the ids in the host's picker.
+            function micCard(onContinue, onSkip) {
+                showPermModal(onContinue, () => {
+                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
+                    if (onSkip) onSkip();
+                });
+            }
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 if (connectBtn.disabled) return;
+
+                // Before any await: iOS only resumes an AudioContext from inside the gesture
+                // that created it, and everything after the first `await` in this handler is
+                // outside that window.
+                let audioReady = null;
+                try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
+
+                // `selectAudioOutput()` is the only permission-free output picker in any engine
+                // and the only one that hands back a *label* without a microphone grant — and it
+                // needs transient activation, which is why the tier had never once been
+                // reportable. This click is the activation. It is spent here, before the join
+                // does anything that would consume it (fullscreen and the keyboard lock come
+                // later, from `startLock`), and a no-op on every engine without the picker.
+                //
+                // Dismissing it is not an error: the join carries on with the default output.
+                let pickPromise = null;
+                try {
+                    if (window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()) {
+                        beginModal();
+                        // Bounded, and `endModal` runs from whichever of the three outcomes
+                        // arrives first. Nothing may leave the page suspended: `modalSuspend`
+                        // gates the gesture handler, so a stuck one costs fullscreen and pointer
+                        // lock for the rest of the session — and the join is itself gated on
+                        // this settling.
+                        pickPromise = pickOutputBounded(null, endModal);
+                    }
+                } catch (_) { noteSuppressed(); }
 
                 const g0 = screenGeom();
                 joinData = {
@@ -1166,7 +3149,7 @@
                     deviceName: nameInput.value.trim(),
                     otp: otpValue(),
                     os: detectOs(),
-                    refreshRate: screenRefreshRate() || 0,
+                    refreshRate: 0,
                     width: g0.width,
                     height: g0.height,
                 };
@@ -1175,6 +3158,9 @@
                 fullscreenMode = fullscreenModeInput.checked;
 
                 showError('');
+                showLinkStatus('');
+                degraded = false;
+                refusedStreak = 0;
                 kicked = false;
                 leaveSent = false;
                 usingFallback = false;
@@ -1185,7 +3171,72 @@
 
                 console.log('[join] connecting with', joinData);
 
-                try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
+                // The fast audio path is decided here rather than from constructor
+                // existence, because the host reads `audioCapabilities` once and, if we
+                // claim the fast path, sends Opus on a DataChannel and puts no audio track
+                // in the answer at all. A prepare() that fails after that point is total
+                // silence with no way back. Safari 26 and Firefox 130 both newly pass the
+                // old constructor sniff, which is what made this urgent.
+                // All three overlap: the worklet module is a fetch, the decoder probe is
+                // async on some engines, and the refresh-rate measurement has its own
+                // deadline. Serialising them would put the sum in front of the picture.
+                const capsPromise = (window.SEAudio ? SEAudio.verifyCapabilities() : Promise.resolve(null))
+                    .catch(() => { noteSuppressed(); return { webcodecsOpus: false, worklet: false }; });
+                // A worklet module that never loads must not hold the join open: past the
+                // deadline the client simply does not claim the fast path.
+                const readyPromise = audioReady
+                    ? Promise.race([
+                        Promise.resolve(audioReady).catch(() => { noteSuppressed(); return false; }),
+                        new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
+                    ])
+                    : Promise.resolve(true);
+                // Audio-output enumeration is for the host's device panel, not for playback,
+                // but it is the one thing on this page that can raise a browser permission
+                // prompt — and a prompt over a live second screen is an interruption. So it
+                // happens here, before a single ICE candidate exists, and the join waits for
+                // the user's answer rather than for a timer. Browsers that need no grant
+                // (anything with `selectAudioOutput`, anything that already shows labels) are
+                // never prompted and this costs one `enumerateDevices()`.
+                //
+                // It runs alongside the three promises above rather than in front of them, so
+                // the refresh-rate measurement and the decoder probe are done by the time the
+                // card is answered — but *behind* the picker where there is one. A granted pick
+                // is what exposes the labels, and an enumeration that started before it would
+                // finish afterwards and overwrite the labelled list with the unlabelled one it
+                // read. The two never both raise UI: an engine with the picker is exactly the
+                // engine `needsMicPermission()` answers no for.
+                let enumPromise = Promise.resolve(null);
+                try {
+                    if (window.SEAudio) {
+                        SEAudio.initSpeakers();
+                        const runEnum = () => {
+                            try { return SEAudio.enumerateBeforeJoin(micCard); } catch (_) { noteSuppressed(); return null; }
+                        };
+                        enumPromise = pickPromise
+                            ? pickPromise.then(runEnum, runEnum)
+                            : Promise.resolve(runEnum());
+                        SEAudio._enumPromise = enumPromise;
+                    }
+                } catch (_) { noteSuppressed(); }
+
+                const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
+                // Transitively awaits the picker where there is one.
+                try { await enumPromise; } catch (_) { noteSuppressed(); }
+
+                if (results[0]) {
+                    audioCaps = results[0];
+                    if (!results[1]) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
+                    audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+                    if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    // verifyCapabilities() derived this from a worklet that was still expected
+                    // to load. It did not, so the host is about to send a fed track and a
+                    // second spare one would be the same audio twice.
+                    audioCaps.wantsFallbackTrack = audioFast;
+                    // No DataChannel off the fast path, so there is nothing for a
+                    // redundant body to ride and nothing true to claim.
+                    audioCaps.redundancy = audioFast;
+                }
+                joinData.refreshRate = results[2];
 
                 beginStreaming();
             });

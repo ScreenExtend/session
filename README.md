@@ -38,14 +38,15 @@ via the `clientId → sessionId` binding recorded on the client's last successfu
 
 | Method & path | Handled by | Notes |
 | --- | --- | --- |
-| `GET /` | relay | Serves `index.html`, sets the `se_cid` cookie. |
-| `GET /styles.css`, `/logo.svg`, `/transform-worker.js`, `/input.js`, `/audio.js`, `/audio-worklet.js`, `/nosleep.js` | relay | Static join-page assets, served verbatim. |
+| `GET /` | relay | Serves `index.html` (`__SAME_DEVICE_FLAG__` → `false`, COOP/COEP for cross-origin isolation), sets the `se_cid` cookie. |
+| `GET /styles.css`, `/logo.svg`, `/transform-worker.js`, `/input.js`, `/audio.js`, `/audio-worker.js`, `/audio-worklet.js`, `/nosleep.js` | relay | Static join-page assets, served verbatim with `Cache-Control: no-cache`. |
 | `GET /health` | relay | Returns `ok` (relay liveness). |
 | `GET /ice-config` | relay | STUN + time-limited TURN credentials. |
-| `GET /net-config` | relay | `{"httpsPort":443}`. |
-| `POST /whep` | tunneled | The join/offer. Body carries `sessionId`, `otp`, `sdp`. |
-| `GET /reconfig` | tunneled | Settings-change / kick poll. Returns `{epoch,kick}`. |
-| `POST /leave` | tunneled | `navigator.sendBeacon` on page hide. Returns `204`. |
+| `GET /net-config` | relay | `{"httpsPort":443,"trickleIce":false}` — trickle ICE (`PATCH /whep/{id}`) is not tunnelled. |
+| `POST /whep` | tunneled | The join/offer. Body carries `sessionId`, `otp`, `sdp`, `joinId`. The host's `x-join-id` and `x-device-token` response headers are passed back. |
+| `GET /reconfig` | tunneled | Settings-change / kick poll. `?join=` is forwarded in the request's `query` field. |
+| `POST /leave` | tunneled | `navigator.sendBeacon` on page hide. `?join=` forwarded in `query`. Returns `204`. |
+| `POST /audio-outputs` | tunneled | The client's audio output list. `?join=` forwarded in `query`. |
 | `GET /host/v1/connect` | relay | Host control WebSocket (registration + signaling tunnel). |
 
 ## Running
@@ -118,7 +119,8 @@ static/                  # join-page assets, embedded at build time via include_
   logo.svg               # logo
   transform-worker.js    # client-side WebCodecs decode/render worker
   input.js               # remote keyboard/mouse/touch over a WebRTC DataChannel
-  audio.js               # system-audio decode (WebCodecs Opus) + playback
+  audio.js               # system-audio playback, output selection, NetEQ fallback
+  audio-worker.js        # Opus decode off the main thread into the shared ring
   audio-worklet.js       # audio jitter buffer / A-V sync worklet
   nosleep.js             # keeps the client screen awake while streaming
 ```

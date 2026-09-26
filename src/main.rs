@@ -34,6 +34,7 @@ const TRANSFORM_WORKER_JS: &str = include_str!("../static/transform-worker.js");
 const INPUT_JS: &str = include_str!("../static/input.js");
 const AUDIO_JS: &str = include_str!("../static/audio.js");
 const AUDIO_WORKLET_JS: &str = include_str!("../static/audio-worklet.js");
+const AUDIO_WORKER_JS: &str = include_str!("../static/audio-worker.js");
 const NOSLEEP_JS: &str = include_str!("../static/nosleep.js");
 
 const SESSION_ID_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -243,6 +244,7 @@ async fn main() {
         .route("/input.js", get(input_js))
         .route("/audio.js", get(audio_js))
         .route("/audio-worklet.js", get(audio_worklet_js))
+        .route("/audio-worker.js", get(audio_worker_js))
         .route("/nosleep.js", get(nosleep_js))
         .route("/health", get(health))
         .route("/ice-config", get(ice_config))
@@ -250,6 +252,10 @@ async fn main() {
         .route("/whep", post(tunnel))
         .route("/reconfig", get(tunnel))
         .route("/leave", post(tunnel))
+        // Posted by audio.js when the output list changes. Tunnelled rather than answered here so
+        // the host can attach the list to the join once it handles the route; a host that does
+        // not answers 404, which the page ignores.
+        .route("/audio-outputs", post(tunnel))
         .route("/host/v1/connect", get(host_ws))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(TraceLayer::new_for_http())
@@ -281,6 +287,7 @@ async fn index(headers: HeaderMap) -> Response {
     )
         .into_response();
     let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
     h.insert(
         header::HeaderName::from_static("cross-origin-opener-policy"),
         header::HeaderValue::from_static("same-origin"),
@@ -298,36 +305,50 @@ async fn index(headers: HeaderMap) -> Response {
     resp
 }
 
-async fn styles() -> Response {
-    ([(header::CONTENT_TYPE, "text/css")], STYLES_CSS).into_response()
-}
-
-async fn logo() -> Response {
-    ([(header::CONTENT_TYPE, "image/svg+xml")], LOGO_SVG).into_response()
-}
-
-async fn worker() -> Response {
+// Every asset is revalidated on each load (`no-cache`), so a deploy never leaves a browser running
+// a fresh `index.html` against a cached older `audio.js` or worker: the page's files are one
+// contract and must move together.
+fn asset(content_type: &'static str, body: &'static str) -> Response {
     (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        TRANSFORM_WORKER_JS,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
     )
         .into_response()
 }
 
+async fn styles() -> Response {
+    asset("text/css", STYLES_CSS)
+}
+
+async fn logo() -> Response {
+    asset("image/svg+xml", LOGO_SVG)
+}
+
+async fn worker() -> Response {
+    asset("text/javascript", TRANSFORM_WORKER_JS)
+}
+
 async fn input_js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript")], INPUT_JS).into_response()
+    asset("text/javascript", INPUT_JS)
 }
 
 async fn audio_js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript")], AUDIO_JS).into_response()
+    asset("text/javascript", AUDIO_JS)
 }
 
 async fn audio_worklet_js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript")], AUDIO_WORKLET_JS).into_response()
+    asset("text/javascript", AUDIO_WORKLET_JS)
+}
+
+async fn audio_worker_js() -> Response {
+    asset("text/javascript", AUDIO_WORKER_JS)
 }
 
 async fn nosleep_js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript")], NOSLEEP_JS).into_response()
+    asset("text/javascript", NOSLEEP_JS)
 }
 
 async fn health() -> &'static str {
@@ -340,8 +361,10 @@ async fn ice_config(State(relay): State<Relay>) -> Response {
     resp
 }
 
+// Deliberately no `trickleIce`: the page trickles only on `trickleIce === true`, and a trickled
+// candidate is a `PATCH /whep/{id}` that neither this relay nor the host tunnel carries.
 async fn net_config() -> Response {
-    Json(json!({ "httpsPort": 443 })).into_response()
+    Json(json!({ "httpsPort": 443, "trickleIce": false })).into_response()
 }
 
 async fn tunnel(
@@ -382,11 +405,7 @@ async fn tunnel(
         match relay.cid_sessions.get(&cid).map(|e| e.clone()) {
             Some(s) => s,
             None => {
-                return if path == "/reconfig" {
-                    finish(StatusCode::NO_CONTENT, "", set_cookie, "text/plain")
-                } else {
-                    finish(StatusCode::NO_CONTENT, "", set_cookie, "text/plain")
-                };
+                return finish(StatusCode::NO_CONTENT, "", set_cookie, "text/plain");
             }
         }
     };
@@ -410,6 +429,9 @@ async fn tunnel(
         "sessionId": session_id,
         "clientId": cid,
         "method": method.as_str(),
+        // `path` stays bare and the query (the page's `?join=<id>`) rides in its own field:
+        // released hosts match the path exactly, so folding the query into it would make them
+        // answer 404 to every `/reconfig` and `/leave`.
         "path": path,
         "query": uri.query().unwrap_or(""),
         "headers": forward_headers(&headers),
@@ -450,7 +472,7 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/whep" => Duration::from_secs(15),
         "/reconfig" => Duration::from_secs(5),
-        "/leave" => Duration::from_secs(3),
+        "/leave" | "/audio-outputs" => Duration::from_secs(3),
         _ => Duration::from_secs(10),
     }
 }
@@ -470,15 +492,18 @@ fn build_tunnel_response(resp: SignalResponse, set_cookie: Option<String>) -> Re
     if let Ok(v) = content_type.parse() {
         out.headers_mut().insert(header::CONTENT_TYPE, v);
     }
-    if let Some(token) = resp
-        .headers
-        .get("x-device-token")
-        .or_else(|| resp.headers.get("X-Device-Token"))
-        .and_then(|v| v.as_str())
-    {
-        if let Ok(v) = token.parse() {
+    // `x-device-token` is what a rejoin presents instead of the OTP, and `x-join-id` is the only
+    // way a relayed page learns which session it holds: there is no `Location` through the
+    // tunnel. Same-origin, so no CORS exposure is needed.
+    for name in ["x-device-token", "x-join-id"] {
+        let value = resp.headers.as_object().and_then(|h| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, v)| v.as_str())
+        });
+        if let Some(v) = value.and_then(|v| header::HeaderValue::from_str(v).ok()) {
             out.headers_mut()
-                .insert(header::HeaderName::from_static("x-device-token"), v);
+                .insert(header::HeaderName::from_static(name), v);
         }
     }
     no_store(out.headers_mut());
