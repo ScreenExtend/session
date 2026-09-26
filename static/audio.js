@@ -214,6 +214,7 @@
         sessionId: '',
         deviceToken: '',
         labelsUnavailable: false,
+        sawOutputs: false,
     };
 
     function detectIOS() {
@@ -312,9 +313,11 @@
     // (`labelled: false` on `/audio-outputs`, `degraded` bit 9) and shows them as "Output 1",
     // which is the honest version of what a grant would have bought.
     //
-    // So: outputs found — labelled or not — no card. Zero outputs, or an enumeration that
-    // threw or timed out, is the one case where the grant is the difference between a list
-    // and nothing at all, and only then is the card raised. `selectAudioOutput()` engines are
+    // So: outputs found — labelled, bare, or even withheld behind empty ids — no card. An
+    // enumeration that threw, timed out or reported no audio output at all is the one case the
+    // card is raised for. Chromium before the grant is in the first group: it lists every
+    // output with an empty id, the default output plays regardless, and a prompt there buys
+    // only the choice of a non-default device, which is not worth interrupting the join for. `selectAudioOutput()` engines are
     // never asked either way; they have a permission-free picker.
     //
     // `known` is the enumeration the caller has already paid for, so the join costs one
@@ -336,7 +339,7 @@
             // output with an empty id, which `listOutputs` drops — falls through to the card.
             let devs = known || await listOutputs();
             if (!devs.length && speakers.micGranted) devs = await listOutputs();
-            if (devs.length) {
+            if (devs.length || speakers.sawOutputs) {
                 if (devs.some((d) => d.label)) speakers._lastEnum = devs;
                 return false;
             }
@@ -413,7 +416,12 @@
                 navigator.mediaDevices.enumerateDevices(),
                 new Promise((r) => setTimeout(() => r(null), ENUM_TIMEOUT_MS)),
             ]);
-            if (!devs) { note(); return []; }
+            if (!devs) { note(); speakers.sawOutputs = false; return []; }
+            // Whether the browser reported any output at all, routable id or not. An engine
+            // without the grant still lists them (with empty ids), and that is an enumeration
+            // that worked: the default output plays fine, only the names and the choice are
+            // withheld. `needsMicPermission()` asks only when this is false.
+            speakers.sawOutputs = devs.some((d) => d.kind === 'audiooutput');
             // A browser that has not granted the microphone yet reports every output with an
             // empty deviceId. Those cannot be selected with setSinkId and the host cannot key a
             // setting by them, so they are not reported.
@@ -422,6 +430,7 @@
                 .map((d) => ({ id: d.deviceId, label: d.label || '' }));
         } catch (_) {
             note();
+            speakers.sawOutputs = false;
             return [];
         }
     }
